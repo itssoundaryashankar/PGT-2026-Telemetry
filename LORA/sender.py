@@ -16,10 +16,13 @@ DEFAULT_IQ = 0
 DEFAULT_PREAMBLE = 8
 DEFAULT_SYNCWORD = 0
 DEFAULT_GROUP = 0
-DEFAULT_ACK = 0
-DEFAULT_RETRIES = 0
+DEFAULT_ACK = 2
+DEFAULT_RETRIES = 3
+DEFAULT_SEND_ATTEMPTS = 3
+DEFAULT_RETRY_DELAY = 2.0
 DEFAULT_TEXT = "Hello-SOLAR"
 RESET_NOTICE = "TAKE EFFECT AFTER ATZ"
+SEND_FAILURE_MARKERS = ("NO ACK", "TIMEOUT", "FAILED", "FAIL")
 
 
 def is_error_line(line):
@@ -29,6 +32,11 @@ def is_error_line(line):
 
 def needs_reset(lines):
     return any(RESET_NOTICE in line.upper() for line in lines)
+
+
+def send_failed(lines):
+    upper_lines = [line.upper() for line in lines]
+    return any(marker in line for line in upper_lines for marker in SEND_FAILURE_MARKERS)
 
 
 def read_available_lines(ser, settle_time=0.2):
@@ -103,6 +111,46 @@ def configure_with_restart(args):
     return ser
 
 
+def send_wait_time(args):
+    # Firmware docs say modem retransmissions are spaced 5 seconds apart.
+    if args.ack == 0:
+        return 1.0
+    return 1.5 + (args.retries * 5.5)
+
+
+def send_once(args, send_mode, payload):
+    with configure_with_restart(args) as ser:
+        lines = require_ok(
+            ser,
+            f"AT+SEND={send_mode},{payload},{args.ack},{args.retries}",
+            wait=send_wait_time(args),
+        )
+        if args.ack != 0 and send_failed(lines):
+            raise RuntimeError(f"Receiver acknowledgement failed: {' | '.join(lines)}")
+
+
+def send_with_retries(args, send_mode, payload):
+    last_error = None
+
+    for attempt in range(1, args.send_attempts + 1):
+        try:
+            send_once(args, send_mode, payload)
+            return attempt
+        except (RuntimeError, serial.SerialException) as exc:
+            last_error = exc
+            if attempt == args.send_attempts:
+                break
+            print(
+                f"[sender] Send attempt {attempt}/{args.send_attempts} failed: {exc}. "
+                f"Retrying in {args.retry_delay:.1f}s..."
+            )
+            time.sleep(args.retry_delay)
+
+    raise RuntimeError(
+        f"Failed to send after {args.send_attempts} attempts: {last_error}"
+    ) from last_error
+
+
 def main():
     parser = argparse.ArgumentParser(description="LoRa sender for AT+SEND firmware")
     parser.add_argument("--port", default=DEFAULT_PORT, help="Serial device path")
@@ -122,6 +170,18 @@ def main():
     parser.add_argument("--hex", help="Hex payload to send instead of text")
     parser.add_argument("--ack", type=int, choices=(0, 1, 2), default=DEFAULT_ACK, help="ACK mode 0/1/2")
     parser.add_argument("--retries", type=int, choices=range(0, 9), default=DEFAULT_RETRIES, help="Retransmissions 0-8")
+    parser.add_argument(
+        "--send-attempts",
+        type=int,
+        default=DEFAULT_SEND_ATTEMPTS,
+        help="Application-level send attempts before failing",
+    )
+    parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=DEFAULT_RETRY_DELAY,
+        help="Seconds to wait between application-level send attempts",
+    )
     args = parser.parse_args()
 
     if args.hex:
@@ -131,11 +191,21 @@ def main():
         send_mode = 1
         payload = args.text
 
-    with configure_with_restart(args) as ser:
-        require_ok(ser, f"AT+SEND={send_mode},{payload},{args.ack},{args.retries}", wait=0.8)
+    if args.send_attempts < 1:
+        raise ValueError("--send-attempts must be at least 1")
+    if args.retry_delay < 0:
+        raise ValueError("--retry-delay must be >= 0")
 
-        label = "hex" if send_mode == 0 else "text"
+    attempts_used = send_with_retries(args, send_mode, payload)
+
+    label = "hex" if send_mode == 0 else "text"
+    if attempts_used == 1:
         print(f"[sender] Sent {label} payload on {args.port}: {payload}")
+    else:
+        print(
+            f"[sender] Sent {label} payload on {args.port} after "
+            f"{attempts_used} attempts: {payload}"
+        )
 
 
 if __name__ == "__main__":
