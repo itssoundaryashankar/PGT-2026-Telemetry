@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 import argparse
-import serial
+import sys
 import time
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
+
+from LORA.lora_transport import LoRaTransport
 
 DEFAULT_PORT = "/dev/tty.usbserial-0002"
 DEFAULT_BAUD = 9600
@@ -21,112 +29,31 @@ DEFAULT_RETRIES = 3
 DEFAULT_SEND_ATTEMPTS = 3
 DEFAULT_RETRY_DELAY = 2.0
 DEFAULT_TEXT = "Hello-SOLAR"
-RESET_NOTICE = "TAKE EFFECT AFTER ATZ"
-SEND_FAILURE_MARKERS = ("NO ACK", "TIMEOUT", "FAILED", "FAIL")
-
-
-def is_error_line(line):
-    upper = line.upper()
-    return "ERROR" in upper or "ERR" == upper or "UNKNOWN" in upper
-
-
-def needs_reset(lines):
-    return any(RESET_NOTICE in line.upper() for line in lines)
-
-
-def send_failed(lines):
-    upper_lines = [line.upper() for line in lines]
-    return any(marker in line for line in upper_lines for marker in SEND_FAILURE_MARKERS)
-
-
-def read_available_lines(ser, settle_time=0.2):
-    time.sleep(settle_time)
-    raw = ser.read_all().decode(errors="ignore")
-    if not raw:
-        return []
-    return [line.strip() for line in raw.replace("\r", "\n").split("\n") if line.strip()]
-
-
-def send_cmd(ser, cmd, wait=0.25):
-    ser.write(f"{cmd.strip()}\r\n".encode())
-    return read_available_lines(ser, wait)
-
-
-def require_ok(ser, cmd, wait=0.25):
-    lines = send_cmd(ser, cmd, wait)
-    if any(is_error_line(line) for line in lines):
-        raise RuntimeError(f"Modem rejected command: {cmd}")
-    if not lines:
-        raise RuntimeError(f"No modem response for command: {cmd}")
-    return lines
-
-
-def try_probe_modem(ser):
-    # Some units answer AT+CFG, others reject it even though they accept the
-    # actual configuration commands. Treat this as informational only.
-    lines = send_cmd(ser, "AT+CFG", wait=0.4)
-    return [] if any(is_error_line(line) for line in lines) else lines
-
-
-def configure_modem(ser, args):
-    reset_required = False
-    try_probe_modem(ser)
-    reset_required |= needs_reset(require_ok(ser, f"AT+FRE={args.freq},{args.freq}"))
-    reset_required |= needs_reset(require_ok(ser, f"AT+BW={args.bw},{args.bw}"))
-    reset_required |= needs_reset(require_ok(ser, f"AT+SF={args.sf},{args.sf}"))
-    reset_required |= needs_reset(require_ok(ser, f"AT+POWER={args.power}"))
-    reset_required |= needs_reset(require_ok(ser, f"AT+CR={args.cr},{args.cr}"))
-    reset_required |= needs_reset(require_ok(ser, f"AT+CRC={args.crc},{args.crc}"))
-    reset_required |= needs_reset(require_ok(ser, f"AT+HEADER={args.header},{args.header}"))
-    reset_required |= needs_reset(require_ok(ser, f"AT+IQ={args.iq},{args.iq}"))
-    reset_required |= needs_reset(require_ok(ser, f"AT+PREAMBLE={args.preamble},{args.preamble}"))
-    reset_required |= needs_reset(require_ok(ser, f"AT+SYNCWORD={args.syncword}"))
-    reset_required |= needs_reset(require_ok(ser, f"AT+GROUPMOD={args.group},{args.group}"))
-    try_probe_modem(ser)
-    return reset_required
-
-
-def open_serial(port, baud):
-    ser = serial.Serial(port, baud, timeout=0.5)
-    time.sleep(0.5)
-    ser.reset_input_buffer()
-    ser.reset_output_buffer()
-    return ser
-
-
-def configure_with_restart(args):
-    ser = open_serial(args.port, args.baud)
-    reset_required = configure_modem(ser, args)
-
-    if not reset_required:
-        return ser
-
-    print("[sender] Applying pending modem settings")
-    send_cmd(ser, "ATZ", wait=0.5)
-    ser.close()
-    time.sleep(2.0)
-
-    ser = open_serial(args.port, args.baud)
-    try_probe_modem(ser)
-    return ser
-
-
-def send_wait_time(args):
-    # Firmware docs say modem retransmissions are spaced 5 seconds apart.
-    if args.ack == 0:
-        return 1.0
-    return 1.5 + (args.retries * 5.5)
 
 
 def send_once(args, send_mode, payload):
-    with configure_with_restart(args) as ser:
-        lines = require_ok(
-            ser,
-            f"AT+SEND={send_mode},{payload},{args.ack},{args.retries}",
-            wait=send_wait_time(args),
-        )
-        if args.ack != 0 and send_failed(lines):
-            raise RuntimeError(f"Receiver acknowledgement failed: {' | '.join(lines)}")
+    with LoRaTransport(
+        port=args.port,
+        baud=args.baud,
+        freq=args.freq,
+        bw=args.bw,
+        sf=args.sf,
+        power=args.power,
+        cr=args.cr,
+        crc=args.crc,
+        header=args.header,
+        iq=args.iq,
+        preamble=args.preamble,
+        syncword=args.syncword,
+        group=args.group,
+        ack=args.ack,
+        retries=args.retries,
+    ) as transport:
+        if send_mode == 0:
+            transport.send_hex(payload)
+        else:
+            payload = payload.encode().hex()
+            transport.send_hex(payload)
 
 
 def send_with_retries(args, send_mode, payload):
@@ -136,7 +63,7 @@ def send_with_retries(args, send_mode, payload):
         try:
             send_once(args, send_mode, payload)
             return attempt
-        except (RuntimeError, serial.SerialException) as exc:
+        except Exception as exc:
             last_error = exc
             if attempt == args.send_attempts:
                 break
