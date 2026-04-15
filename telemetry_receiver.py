@@ -4,6 +4,7 @@ import time
 
 from BMV.bmv_handler import format_bmv_packet
 from LORA.lora_transport import LoRaTransport, extract_hex_payload
+from storage.event_csv_sink import write_event_csv
 from telemetry_packet import MsgType, decode_packet
 
 
@@ -29,6 +30,11 @@ def route_packet(decoded, handlers=None):
     return handler(decoded)
 
 
+def dispatch_event(decoded, sinks=None):
+    for sink in sinks or ():
+        sink(decoded)
+
+
 def run_receiver(
     *,
     transport,
@@ -39,6 +45,7 @@ def run_receiver(
     wait=0.3,
     show_raw=False,
     handlers=None,
+    sinks=None,
     log_prefix="receiver",
 ):
     print(f"[{log_prefix}] Starting receiver loop")
@@ -60,6 +67,7 @@ def run_receiver(
                     print(f"[rx-raw] {line}")
                 continue
 
+            dispatch_event(decoded, sinks=sinks)
             routed = route_packet(decoded, handlers=handlers)
             if routed is None:
                 print(f"[rx] {decoded}")
@@ -85,6 +93,7 @@ DEFAULT_SYNCWORD = 0
 DEFAULT_GROUP = 0
 DEFAULT_RX_TIMEOUT = 65535
 DEFAULT_RX_ACK = 2
+DEFAULT_CSV_PATH = "received_events.csv"
 
 
 def build_transport(args):
@@ -113,6 +122,14 @@ def build_handlers(_args):
     }
 
 
+def build_sinks(args):
+    if not args.csv_path:
+        return ()
+    return (
+        lambda event: write_event_csv(args.csv_path, event),
+    )
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Generic telemetry receiver")
     parser.add_argument("--transport", choices=("lora",), default=DEFAULT_TRANSPORT)
@@ -133,6 +150,7 @@ def build_parser():
     parser.add_argument("--rx-ack", type=int, default=DEFAULT_RX_ACK, help="ACK mode 0/1/2")
     parser.add_argument("--recv-format", type=int, choices=(0, 1), default=0, help="AT+RECV format 0=hex 1=text")
     parser.add_argument("--poll", type=float, default=1.0, help="Seconds between AT+RECV polls")
+    parser.add_argument("--csv-path", default=DEFAULT_CSV_PATH, help="CSV output path for decoded events")
     parser.add_argument("--show-raw", action="store_true", help="Print raw modem receive lines")
     return parser
 
@@ -152,6 +170,7 @@ def main(argv=None):
             wait=0.3,
             show_raw=args.show_raw,
             handlers=build_handlers(args),
+            sinks=build_sinks(args),
             log_prefix="receiver",
         )
 
