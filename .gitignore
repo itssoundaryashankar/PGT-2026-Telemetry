@@ -17,3 +17,8 @@ ENV/
 .vscode/
 
 *.csv
+
+# PyInstaller artifacts
+build/
+dist/
+*.spec
