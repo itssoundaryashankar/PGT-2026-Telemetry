@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 import argparse
+import os
+import sys
 import time
+from datetime import datetime, timezone
+
+# Force line-buffered stdout so messages appear immediately even when the
+# script is run under an IDE, redirected, or piped (Windows + PowerShell in
+# particular love to switch to block-buffering, which makes the program look
+# stuck during the blocking serial read).
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except AttributeError:
+    pass  # Python < 3.7, very unlikely here
 
 from BMV.bmv_handler import format_bmv_packet
 from LORA.lora_transport import LoRaTransport, extract_hex_payload
@@ -8,14 +20,217 @@ from storage.event_csv_sink import write_event_csv
 from telemetry_packet import MsgType, decode_packet
 
 
-def decode_line(line, extract_payload, decoder):
+# ─────────────────────────────────────────────────────────────────────────────
+# INFLUXDB WRITER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class InfluxWriter:
+    """Writes decoded telemetry events to InfluxDB v2.
+
+    Numeric values are stored as fields, strings/enums as fields too. Anything
+    that isn't a primitive (e.g. nested dicts, MsgType enums) is coerced to a
+    string representation so the point still goes through.
+    """
+
+    def __init__(self, url, token, org, bucket, measurement):
+        # Imported here so the script still runs without influxdb-client
+        # installed when --influx-enable is not set.
+        from influxdb_client import InfluxDBClient
+        from influxdb_client.client.write_api import SYNCHRONOUS
+
+        self.bucket = bucket
+        self.measurement = measurement
+        self.client = InfluxDBClient(url=url, token=token, org=org)
+        self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
+        print(f"[influx] Connected to {url}  bucket={bucket}")
+
+    def write(self, event: dict, tags: dict | None = None):
+        if not event:
+            return
+
+        numeric_fields: dict = {}
+        string_fields: dict = {}
+
+        for k, v in event.items():
+            if v is None:
+                continue
+            if isinstance(v, bool):
+                numeric_fields[k] = int(v)
+            elif isinstance(v, (int, float)):
+                numeric_fields[k] = float(v)
+            elif isinstance(v, str):
+                string_fields[k] = v
+            elif isinstance(v, MsgType):
+                string_fields[k] = v.name
+            else:
+                # Fallback: stringify anything else (dicts, lists, enums, ...)
+                string_fields[k] = str(v)
+
+        all_fields = {**numeric_fields, **string_fields}
+        if not all_fields:
+            return
+
+        # Guarantee at least one numeric field so the point shows up in graphs
+        if not numeric_fields:
+            all_fields["received"] = 1.0
+
+        record = {
+            "measurement": self.measurement,
+            "tags": dict(tags or {}),
+            "fields": all_fields,
+            "time": datetime.now(timezone.utc),
+        }
+        try:
+            self.write_api.write(bucket=self.bucket, record=record)
+        except Exception as exc:
+            print(f"[influx] Write failed: {exc}")
+
+    def close(self):
+        try:
+            self.client.close()
+        except Exception:
+            pass
+
+
+def make_influx_sink(writer: InfluxWriter, tags: dict):
+    def _sink(event: dict):
+        writer.write(event, tags=tags)
+    return _sink
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ASCII FALLBACK DECODER
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Used when the binary `decode_packet` can't make sense of the bytes (e.g.
+# bench tests where the sender just transmits "67.67"). Mirrors the formats
+# supported by dragino_lora_influx.py: JSON, key=value, bare number, CSV,
+# plain text.
+
+import json
+import re
+
+
+def _clean_ascii(text: str) -> str:
+    if not text:
+        return ""
+    return text.replace("\x00", "").replace("\ufffd", "").strip()
+
+
+def decode_ascii_payload(raw: bytes) -> dict | None:
+    """Try to decode `raw` as ASCII telemetry. Returns a decoded event dict
+    on success, or None if the bytes don't look like usable text."""
+    if not raw:
+        return None
+
+    hex_repr = raw.hex()
+
+    try:
+        text = _clean_ascii(raw.decode("utf-8"))
+    except UnicodeDecodeError:
+        return None
+
+    if not text:
+        return None
+
+    event: dict = {
+        "msg_type": "ASCII",
+        "payload": text,
+        "payload_hex": hex_repr,
+    }
+
+    # 1. JSON object
+    if text.startswith("{"):
+        try:
+            obj = json.loads(text)
+            for k, v in obj.items():
+                try:
+                    event[k.lower()] = float(v)
+                except (TypeError, ValueError):
+                    if isinstance(v, str):
+                        event[k.lower()] = v
+            return event
+        except json.JSONDecodeError:
+            pass
+
+    # 2. key=value pairs  (e.g. "temp=24.5,hum=60")
+    kv = re.findall(r"(\w+)=([-+]?[\d.]+)", text)
+    if kv:
+        for k, v in kv:
+            try:
+                event[k.lower()] = float(v)
+            except ValueError:
+                pass
+        if len(event) > 3:  # got at least one real field beyond the defaults
+            return event
+
+    # 3. Bare number (e.g. "67.67")
+    try:
+        event["value"] = float(text)
+        return event
+    except ValueError:
+        pass
+
+    # 4. CSV numbers (e.g. "24.5,60.1,3.3")
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    if len(parts) >= 2:
+        try:
+            nums = [float(p) for p in parts]
+            for i, v in enumerate(nums[:5]):
+                event[f"value_{i}"] = v
+            return event
+        except ValueError:
+            pass
+
+    # 5. Plain text — return with payload field only, no numerics
+    return event
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DECODE / DISPATCH
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _looks_decoded(decoded) -> bool:
+    """Heuristic: did the binary decoder actually recognise the packet?
+    We accept only results with a proper MsgType enum — anything else
+    (including a dict with a stray integer 'msg_type') is treated as
+    'binary decoder didn't really know what this was' and we fall
+    through to ASCII."""
+    if not isinstance(decoded, dict):
+        return False
+    return isinstance(decoded.get("msg_type"), MsgType)
+
+
+def decode_line(line, extract_payload, decoder, ascii_fallback=True):
     payload_hex = extract_payload(line)
     if not payload_hex:
         return None
     packet = bytes.fromhex(payload_hex)
-    if len(packet) <= 2:
+    if not packet:
         return None
-    return decoder(packet)
+
+    binary_error = None
+    if len(packet) > 2:
+        try:
+            decoded = decoder(packet)
+        except ValueError as exc:
+            binary_error = exc
+            decoded = None
+
+        if _looks_decoded(decoded):
+            return decoded
+
+    # Fall through to ASCII
+    if ascii_fallback:
+        ascii_decoded = decode_ascii_payload(packet)
+        if ascii_decoded is not None:
+            return ascii_decoded
+
+    # Nothing worked — re-raise the original binary error if there was one,
+    # so the caller's existing error message still surfaces.
+    if binary_error is not None:
+        raise binary_error
+    return None
 
 
 def route_packet(decoded, handlers=None):
@@ -32,7 +247,14 @@ def route_packet(decoded, handlers=None):
 
 def dispatch_event(decoded, sinks=None):
     for sink in sinks or ():
-        sink(decoded)
+        try:
+            sink(decoded)
+        except Exception as exc:
+            print(f"[rx] Sink error: {exc}")
+
+
+def _now_str():
+    return datetime.now().strftime("%H:%M:%S")
 
 
 def run_receiver(
@@ -47,8 +269,10 @@ def run_receiver(
     handlers=None,
     sinks=None,
     log_prefix="receiver",
+    ascii_fallback=True,
 ):
-    print(f"[{log_prefix}] Starting receiver loop")
+    print(f"[{log_prefix}] Starting receiver loop", flush=True)
+    print(f"\n📡 Listening for LoRa data — press Ctrl-C to stop\n", flush=True)
 
     while True:
         lines = transport.receive_hex_lines(recv_format=recv_format, wait=wait)
@@ -57,7 +281,8 @@ def run_receiver(
                 print(f"[rx-raw] {line}")
 
             try:
-                decoded = decode_line(line, extract_payload, decoder)
+                decoded = decode_line(line, extract_payload, decoder,
+                                      ascii_fallback=ascii_fallback)
             except ValueError as exc:
                 print(f"[rx] Failed to parse/decode '{line}': {exc}")
                 continue
@@ -67,7 +292,13 @@ def run_receiver(
                     print(f"[rx-raw] {line}")
                 continue
 
+            # Highly visible "we got something" line, before sinks/handlers run
+            msg_type = decoded.get("msg_type")
+            type_label = msg_type.name if isinstance(msg_type, MsgType) else str(msg_type)
+            print(f"✅ [{_now_str()}] Received packet  type={type_label}", flush=True)
+
             dispatch_event(decoded, sinks=sinks)
+
             routed = route_packet(decoded, handlers=handlers)
             if routed is None:
                 print(f"[rx] {decoded}")
@@ -77,8 +308,12 @@ def run_receiver(
         time.sleep(poll_interval)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DEFAULTS
+# ─────────────────────────────────────────────────────────────────────────────
+
 DEFAULT_TRANSPORT = "lora"
-DEFAULT_PORT = "/dev/tty.usbserial-0001"
+DEFAULT_PORT = "COM4"
 DEFAULT_BAUD = 9600
 DEFAULT_FREQ = "868.100"
 DEFAULT_BW = 0
@@ -95,6 +330,17 @@ DEFAULT_RX_TIMEOUT = 65535
 DEFAULT_RX_ACK = 2
 DEFAULT_CSV_PATH = "received_events.csv"
 
+# InfluxDB defaults — overridable via CLI args or env vars
+DEFAULT_INFLUX_URL = os.getenv("INFLUX_URL", "http://localhost:8086")
+DEFAULT_INFLUX_TOKEN = os.getenv("INFLUX_TOKEN", "")
+DEFAULT_INFLUX_ORG = os.getenv("INFLUX_ORG", "my-org")
+DEFAULT_INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "lorawan-data")
+DEFAULT_INFLUX_MEASUREMENT = os.getenv("INFLUX_MEASUREMENT", "telemetry")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WIRING
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_transport(args):
     return LoRaTransport(
@@ -122,11 +368,32 @@ def build_handlers(_args):
     }
 
 
-def build_sinks(args):
-    if not args.csv_path:
-        return ()
-    return (
-        lambda event: write_event_csv(args.csv_path, event),
+def build_sinks(args, influx_writer=None):
+    sinks = []
+
+    if args.csv_path:
+        sinks.append(lambda event: write_event_csv(args.csv_path, event))
+
+    if influx_writer is not None:
+        tags = {"source": "telemetry_receiver", "port": args.port}
+        sinks.append(make_influx_sink(influx_writer, tags))
+
+    return tuple(sinks)
+
+
+def build_influx_writer(args):
+    if not args.influx_enable:
+        return None
+    if not args.influx_token:
+        print("[influx] --influx-enable set but no token provided "
+              "(use --influx-token or INFLUX_TOKEN env var). Skipping InfluxDB.")
+        return None
+    return InfluxWriter(
+        url=args.influx_url,
+        token=args.influx_token,
+        org=args.influx_org,
+        bucket=args.influx_bucket,
+        measurement=args.influx_measurement,
     )
 
 
@@ -152,6 +419,22 @@ def build_parser():
     parser.add_argument("--poll", type=float, default=1.0, help="Seconds between AT+RECV polls")
     parser.add_argument("--csv-path", default=DEFAULT_CSV_PATH, help="CSV output path for decoded events")
     parser.add_argument("--show-raw", action="store_true", help="Print raw modem receive lines")
+    parser.add_argument("--no-ascii-fallback", action="store_true",
+                        help="Disable the ASCII fallback decoder (binary packets only)")
+
+    # InfluxDB options
+    parser.add_argument("--influx-enable", action="store_true",
+                        help="Enable writing decoded events to InfluxDB v2")
+    parser.add_argument("--influx-url", default=DEFAULT_INFLUX_URL,
+                        help="InfluxDB v2 URL (env: INFLUX_URL)")
+    parser.add_argument("--influx-token", default=DEFAULT_INFLUX_TOKEN,
+                        help="InfluxDB v2 API token (env: INFLUX_TOKEN)")
+    parser.add_argument("--influx-org", default=DEFAULT_INFLUX_ORG,
+                        help="InfluxDB v2 organisation (env: INFLUX_ORG)")
+    parser.add_argument("--influx-bucket", default=DEFAULT_INFLUX_BUCKET,
+                        help="InfluxDB v2 bucket (env: INFLUX_BUCKET)")
+    parser.add_argument("--influx-measurement", default=DEFAULT_INFLUX_MEASUREMENT,
+                        help="InfluxDB measurement name (env: INFLUX_MEASUREMENT)")
     return parser
 
 
@@ -160,19 +443,26 @@ def main(argv=None):
     if args.transport != "lora":
         raise ValueError(f"Unsupported transport {args.transport}")
 
-    with build_transport(args) as transport:
-        run_receiver(
-            transport=transport,
-            decoder=decode_packet,
-            extract_payload=extract_hex_payload,
-            recv_format=args.recv_format,
-            poll_interval=args.poll,
-            wait=0.3,
-            show_raw=args.show_raw,
-            handlers=build_handlers(args),
-            sinks=build_sinks(args),
-            log_prefix="receiver",
-        )
+    influx_writer = build_influx_writer(args)
+
+    try:
+        with build_transport(args) as transport:
+            run_receiver(
+                transport=transport,
+                decoder=decode_packet,
+                extract_payload=extract_hex_payload,
+                recv_format=args.recv_format,
+                poll_interval=args.poll,
+                wait=0.3,
+                show_raw=args.show_raw,
+                handlers=build_handlers(args),
+                sinks=build_sinks(args, influx_writer=influx_writer),
+                log_prefix="receiver",
+                ascii_fallback=not args.no_ascii_fallback,
+            )
+    finally:
+        if influx_writer is not None:
+            influx_writer.close()
 
 
 if __name__ == "__main__":
