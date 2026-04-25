@@ -391,7 +391,7 @@ DEFAULT_CSV_PATH = "received_events.csv"
 DEFAULT_INFLUX_URL = os.getenv("INFLUX_URL", "http://localhost:8086")
 DEFAULT_INFLUX_TOKEN = os.getenv("INFLUX_TOKEN", "")
 DEFAULT_INFLUX_ORG = os.getenv("INFLUX_ORG", "my-org")
-DEFAULT_INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "lorawan-data")
+DEFAULT_INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "BMV-data")
 DEFAULT_INFLUX_MEASUREMENT = os.getenv("INFLUX_MEASUREMENT", "telemetry")
 
 
