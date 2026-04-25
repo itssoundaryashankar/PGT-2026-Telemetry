@@ -24,6 +24,27 @@ from telemetry_packet import MsgType, decode_packet
 # INFLUXDB WRITER
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _flatten_event(event: dict, prefix: str = "", out: dict | None = None) -> dict:
+    """Flatten a decoded packet so nested dicts become dotted-name fields.
+    e.g. {'data': {'voltage': 12.5}} -> {'data_voltage': 12.5}.
+    Lists/tuples of primitives become indexed fields: foo_0, foo_1, ..."""
+    if out is None:
+        out = {}
+    for k, v in event.items():
+        key = f"{prefix}{k}" if not prefix else f"{prefix}_{k}"
+        if isinstance(v, dict):
+            _flatten_event(v, prefix=key, out=out)
+        elif isinstance(v, (list, tuple)):
+            for i, item in enumerate(v):
+                if isinstance(item, dict):
+                    _flatten_event(item, prefix=f"{key}_{i}", out=out)
+                else:
+                    out[f"{key}_{i}"] = item
+        else:
+            out[key] = v
+    return out
+
+
 class InfluxWriter:
     """Writes decoded telemetry events to InfluxDB v2.
 
@@ -48,35 +69,54 @@ class InfluxWriter:
         if not event:
             return
 
+        # Flatten nested dicts so {data: {voltage: 12.5}} becomes
+        # {data_voltage: 12.5} instead of being stringified into oblivion.
+        flat = _flatten_event(event)
+
         numeric_fields: dict = {}
         string_fields: dict = {}
+        point_tags = dict(tags or {})
 
-        for k, v in event.items():
+        for k, v in flat.items():
             if v is None:
                 continue
+
+            # msg_type goes into TAGS (not fields) so InfluxDB can index it
+            # for fast filtering — that's how you separate BMV / ASCII / etc.
+            if k == "msg_type":
+                if isinstance(v, MsgType):
+                    point_tags["msg_type"] = v.name
+                else:
+                    point_tags["msg_type"] = str(v)
+                continue
+
             if isinstance(v, bool):
                 numeric_fields[k] = int(v)
             elif isinstance(v, (int, float)):
                 numeric_fields[k] = float(v)
             elif isinstance(v, str):
+                # Skip the noisy debug strings to avoid cluttering Data Explorer
+                if k in ("payload_hex",):
+                    continue
                 string_fields[k] = v
             elif isinstance(v, MsgType):
                 string_fields[k] = v.name
             else:
-                # Fallback: stringify anything else (dicts, lists, enums, ...)
                 string_fields[k] = str(v)
 
         all_fields = {**numeric_fields, **string_fields}
         if not all_fields:
+            print(f"[influx] Skipping write: no usable fields in {event}")
             return
 
-        # Guarantee at least one numeric field so the point shows up in graphs
         if not numeric_fields:
             all_fields["received"] = 1.0
+            print(f"[influx] No numeric fields in event, only strings: "
+                  f"{list(string_fields.keys())}")
 
         record = {
             "measurement": self.measurement,
-            "tags": dict(tags or {}),
+            "tags": point_tags,
             "fields": all_fields,
             "time": datetime.now(timezone.utc),
         }
@@ -274,8 +314,25 @@ def run_receiver(
     print(f"[{log_prefix}] Starting receiver loop", flush=True)
     print(f"\n📡 Listening for LoRa data — press Ctrl-C to stop\n", flush=True)
 
+    consecutive_errors = 0
+    MAX_CONSECUTIVE_ERRORS = 10  # bail out only after sustained failure
+
     while True:
-        lines = transport.receive_hex_lines(recv_format=recv_format, wait=wait)
+        try:
+            lines = transport.receive_hex_lines(recv_format=recv_format, wait=wait)
+            consecutive_errors = 0  # reset on any successful poll
+        except RuntimeError as exc:
+            consecutive_errors += 1
+            print(f"[rx] Modem poll failed ({consecutive_errors}/"
+                  f"{MAX_CONSECUTIVE_ERRORS}): {exc}", flush=True)
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                print(f"[rx] Modem unresponsive for {MAX_CONSECUTIVE_ERRORS} "
+                      f"polls in a row — giving up.", flush=True)
+                raise
+            # Back off briefly so we don't hammer a confused modem
+            time.sleep(min(2.0 * consecutive_errors, 10.0))
+            continue
+
         for line in lines:
             if show_raw:
                 print(f"[rx-raw] {line}")
@@ -313,7 +370,7 @@ def run_receiver(
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_TRANSPORT = "lora"
-DEFAULT_PORT = "COM4"
+DEFAULT_PORT = "/dev/tty.usbserial-0001"
 DEFAULT_BAUD = 9600
 DEFAULT_FREQ = "868.100"
 DEFAULT_BW = 0
@@ -398,6 +455,9 @@ def build_influx_writer(args):
 
 
 def build_parser():
+    parser.add_argument("--influx-enable", action="store_true",
+                    default=True,                              # ← add this
+                    help="Enable writing decoded events to InfluxDB v2")
     parser = argparse.ArgumentParser(description="Generic telemetry receiver")
     parser.add_argument("--transport", choices=("lora",), default=DEFAULT_TRANSPORT)
     parser.add_argument("--port", default=DEFAULT_PORT, help="Serial device path")
