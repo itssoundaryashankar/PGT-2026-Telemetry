@@ -1,64 +1,75 @@
 #!/usr/bin/env python3
-"""Generic delta + heartbeat transmit policy.
+"""Per-CAN-ID transmit policy.
 
-Modeled on BMVTransmitPolicy but parameterized: the caller provides a
-mapping of field-name -> minimum-delta. Any field changing by more than
-its delta triggers a transmit. A heartbeat ensures we send something
-even when nothing has changed.
+Solar car CAN buses repeat the same frames at 10-100 Hz when nothing is
+moving. LoRa cannot carry that. This policy classifies each frame into
+one of:
 
-Returns an `event_type` enum-ish value when a transmit is warranted, or
-None when not. The actual enum members come from the telemetry_packet
-module — this policy just hands back whatever was passed in as
-event_type_change / event_type_heartbeat at construction time.
+    SAMPLE             — first time we've seen this ID
+    DELTA_UPDATE       — payload bytes changed
+    HEARTBEAT          — payload unchanged but >heartbeat_seconds since
+                          last transmission for this ID
+    None               — skip (rate-limited or duplicate)
+
+State is tracked per CAN ID, so a fast-moving MPPT current frame and a
+slow BMS state-of-charge frame each get their own cadence.
 """
 
 import time
 
+from telemetry_packet import EventType
 
-class GenericTransmitPolicy:
-    def __init__(self, deltas: dict, event_type_change, event_type_heartbeat,
-                 heartbeat_seconds: float = 60.0):
+
+class CANTransmitPolicy:
+    def __init__(self, min_interval_seconds=1.0, heartbeat_seconds=60.0):
         """
-        deltas: {field_name: min_change_to_trigger_transmit}
-        event_type_change: enum value to use when a delta is exceeded
-        event_type_heartbeat: enum value to use for heartbeat-only sends
-        heartbeat_seconds: send a heartbeat at least this often
+        min_interval_seconds:  minimum gap between transmissions for the
+                               same CAN ID, even when the payload changes.
+                               Set to 0 to forward every change.
+        heartbeat_seconds:     forward an unchanged frame after this long
+                               of silence, so the receiver knows the bus
+                               is still alive.
         """
-        self.deltas = dict(deltas)
-        self.change_event = event_type_change
-        self.heartbeat_event = event_type_heartbeat
+        self.min_interval_seconds = min_interval_seconds
         self.heartbeat_seconds = heartbeat_seconds
-
-        self._last_sent_fields: dict = {}
-        self._last_sent_time: float = 0.0
-        self._seq: int = 0
+        # Per-ID state: {can_id: {"data": bytes, "sent_at": float}}
+        self._last_by_id = {}
+        # Pending classification state for mark_sent to commit.
+        self._pending = None
+        self.seq = 0
 
     def classify(self, reading):
-        fields = reading.get("fields", {})
+        can_id = reading["can_id"]
+        data_hex = reading["fields"]["data_hex"]
+        data = bytes.fromhex(data_hex) if data_hex else b""
         now = time.time()
 
-        # First reading? Always send.
-        if not self._last_sent_fields:
-            return self.change_event
+        previous = self._last_by_id.get(can_id)
+        event_type = None
 
-        # Heartbeat overdue?
-        if now - self._last_sent_time >= self.heartbeat_seconds:
-            return self.heartbeat_event
+        if previous is None:
+            event_type = EventType.SAMPLE
+        else:
+            since_last = now - previous["sent_at"]
+            changed = data != previous["data"]
 
-        # Any tracked field exceeded its delta?
-        for name, threshold in self.deltas.items():
-            if name not in fields:
-                continue
-            prev = self._last_sent_fields.get(name)
-            if prev is None:
-                return self.change_event
-            if abs(fields[name] - prev) >= threshold:
-                return self.change_event
+            if changed and since_last >= self.min_interval_seconds:
+                event_type = EventType.DELTA_UPDATE
+            elif since_last >= self.heartbeat_seconds:
+                event_type = EventType.HEARTBEAT
+            # else: skip (rate-limited duplicate or rate-limited change)
 
-        return None
+        if event_type is not None:
+            self._pending = (can_id, data, now)
+        return event_type
 
     def mark_sent(self, reading):
-        self._last_sent_fields = dict(reading.get("fields", {}))
-        self._last_sent_time = time.time()
-        self._seq = (self._seq + 1) & 0xFFFF
-        return self._seq
+        """Commit the most recent classify() decision and return seq."""
+        if self._pending is not None:
+            can_id, data, now = self._pending
+            self._last_by_id[can_id] = {"data": data, "sent_at": now}
+            self._pending = None
+
+        current_seq = self.seq
+        self.seq = (self.seq + 1) & 0xFFFF
+        return current_seq
