@@ -1,75 +1,135 @@
 #!/usr/bin/env python3
-"""Per-CAN-ID transmit policy.
+"""Field-delta-based transmit policy for CAN-derived telemetry.
 
-Solar car CAN buses repeat the same frames at 10-100 Hz when nothing is
-moving. LoRa cannot carry that. This policy classifies each frame into
-one of:
+Matches the contract the BMV policy provides (classify / mark_sent), but
+generalised:
 
-    SAMPLE             — first time we've seen this ID
-    DELTA_UPDATE       — payload bytes changed
-    HEARTBEAT          — payload unchanged but >heartbeat_seconds since
-                          last transmission for this ID
-    None               — skip (rate-limited or duplicate)
+  - Tracks state per "source key", not just one global last-sent. Multiple
+    MPPTs sharing one policy each get their own last-known state. The
+    source key defaults to device_id, which is what the MPPT normalizer
+    increments per board.
 
-State is tracked per CAN ID, so a fast-moving MPPT current frame and a
-slow BMS state-of-charge frame each get their own cadence.
+  - Tracks state per "frame kind" for BMSes, because different CAN IDs
+    from one BMS pack carry different fields (SOC on 0x355, voltage on
+    0x356) — comparing 0x355's SOC against the 0x356 reading we last
+    stored would be a category error. Within a single source, each
+    *can_id_hex* gets its own slot. If the reading has no can_id_hex
+    (MPPT case — already collapsed into one frame per board), it uses
+    a default slot per source.
+
+Configurable per-field deltas: when ANY watched field has moved by at
+least its delta since the last send (or any field appears that didn't
+before, or any field disappears), we emit event_type_change. Otherwise,
+once heartbeat_seconds has elapsed, we emit event_type_heartbeat.
 """
 
 import time
 
-from telemetry_packet import EventType
 
-
-class CANTransmitPolicy:
-    def __init__(self, min_interval_seconds=1.0, heartbeat_seconds=60.0):
+class GenericTransmitPolicy:
+    def __init__(self, deltas, event_type_change, event_type_heartbeat,
+                 heartbeat_seconds=60):
         """
-        min_interval_seconds:  minimum gap between transmissions for the
-                               same CAN ID, even when the payload changes.
-                               Set to 0 to forward every change.
-        heartbeat_seconds:     forward an unchanged frame after this long
-                               of silence, so the receiver knows the bus
-                               is still alive.
+        deltas:                  {field_name: minimum_change_to_transmit}
+                                 Fields not in this dict are not watched.
+                                 Strings & flags are typically not in here.
+        event_type_change:       EventType emitted when a field moved
+                                 enough. Required.
+        event_type_heartbeat:    EventType emitted when heartbeat fires.
+                                 May equal event_type_change.
+        heartbeat_seconds:       Force a transmit this long after the
+                                 last one even if nothing changed.
         """
-        self.min_interval_seconds = min_interval_seconds
+        self.deltas = dict(deltas)
+        self.event_type_change = event_type_change
+        self.event_type_heartbeat = event_type_heartbeat
         self.heartbeat_seconds = heartbeat_seconds
-        # Per-ID state: {can_id: {"data": bytes, "sent_at": float}}
-        self._last_by_id = {}
-        # Pending classification state for mark_sent to commit.
-        self._pending = None
+
+        # Per-(source_key, slot_key) state:
+        #   { (src, slot): {"fields": {...}, "sent_at": float} }
+        self._state = {}
+        self._pending_key = None
+        self._pending_reading = None
+        self._pending_now = None
         self.seq = 0
 
-    def classify(self, reading):
-        can_id = reading["can_id"]
-        data_hex = reading["fields"]["data_hex"]
-        data = bytes.fromhex(data_hex) if data_hex else b""
-        now = time.time()
+    @staticmethod
+    def _keys(reading):
+        # Default source key is device_id. For BMS, the slot key is the
+        # CAN ID — different IDs carry different fields. For everything
+        # else (MPPT collapses everything into one frame), one slot per
+        # source.
+        src = reading["device_id"]
+        slot = reading["fields"].get("can_id_hex", "_only")
+        return src, slot
 
-        previous = self._last_by_id.get(can_id)
-        event_type = None
+    def classify(self, reading):
+        src, slot = self._keys(reading)
+        now = time.time()
+        previous = self._state.get((src, slot))
 
         if previous is None:
-            event_type = EventType.SAMPLE
+            event_type = self.event_type_change
         else:
             since_last = now - previous["sent_at"]
-            changed = data != previous["data"]
-
-            if changed and since_last >= self.min_interval_seconds:
-                event_type = EventType.DELTA_UPDATE
+            if self._changed_enough(reading["fields"], previous["fields"]):
+                event_type = self.event_type_change
             elif since_last >= self.heartbeat_seconds:
-                event_type = EventType.HEARTBEAT
-            # else: skip (rate-limited duplicate or rate-limited change)
+                event_type = self.event_type_heartbeat
+            else:
+                event_type = None
 
         if event_type is not None:
-            self._pending = (can_id, data, now)
+            self._pending_key = (src, slot)
+            self._pending_reading = reading
+            self._pending_now = now
         return event_type
 
     def mark_sent(self, reading):
-        """Commit the most recent classify() decision and return seq."""
-        if self._pending is not None:
-            can_id, data, now = self._pending
-            self._last_by_id[can_id] = {"data": data, "sent_at": now}
-            self._pending = None
+        # Commit whatever classify() decided. We use the cached pending
+        # state rather than recomputing, so this method is cheap and the
+        # source/slot key matches exactly.
+        if self._pending_key is not None and self._pending_reading is reading:
+            self._state[self._pending_key] = {
+                "fields": dict(reading["fields"]),
+                "sent_at": self._pending_now,
+            }
+            self._pending_key = None
+            self._pending_reading = None
+            self._pending_now = None
+        else:
+            # Defensive: caller invoked mark_sent on a different reading
+            # than the last classify(). Record current state anyway so we
+            # don't get stuck claiming "nothing changed" forever.
+            src, slot = self._keys(reading)
+            self._state[(src, slot)] = {
+                "fields": dict(reading["fields"]),
+                "sent_at": time.time(),
+            }
 
         current_seq = self.seq
         self.seq = (self.seq + 1) & 0xFFFF
         return current_seq
+
+    def _changed_enough(self, current_fields, previous_fields):
+        # New or removed field counts as a change.
+        watched_now = set(self.deltas) & set(current_fields)
+        watched_then = set(self.deltas) & set(previous_fields)
+        if watched_now != watched_then:
+            return True
+
+        for field, threshold in self.deltas.items():
+            if field not in current_fields:
+                continue
+            cur = current_fields[field]
+            prev = previous_fields.get(field)
+            if prev is None:
+                return True
+            try:
+                if abs(float(cur) - float(prev)) >= threshold:
+                    return True
+            except (TypeError, ValueError):
+                # Non-numeric watched field — fall back to equality
+                if cur != prev:
+                    return True
+        return False
