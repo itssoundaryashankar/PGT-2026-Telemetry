@@ -1,110 +1,101 @@
 #!/usr/bin/env python3
-"""SocketCAN frame reader.
+"""SocketCAN reader for the telemetry pipeline.
 
-Mirrors the BMVReader interface so it drops into run_sender unchanged:
-    reader.read_frame() -> dict
-    reader.close()
+read_frame() returns (kind, raw_frame_dict) tuples where `kind` is one of
+the strings in the id_to_kind mapping passed at construction time (e.g.
+"mppt" / "bms"). The normalizer for that kind decodes the bytes into named
+fields.
 
-Uses python-can with kernel-level CAN filters so the firehose never
-reaches Python — only the IDs you actually care about cross the
-syscall boundary.
+The reader applies kernel-level CAN filters built from id_to_kind, so frames
+with unmapped IDs never reach Python — important on a 125 kbps bus that
+might be carrying motor controller chatter we don't care about.
 
-Expected setup on the Pi (Waveshare RS485 CAN HAT or similar
-MCP2515-based HAT):
+Pi setup recap:
+    /boot/firmware/config.txt:
+        dtparam=spi=on
+        dtoverlay=mcp2515-can0,oscillator=12000000,interrupt=25
 
-    # /boot/firmware/config.txt:
-    dtparam=spi=on
-    dtoverlay=mcp2515-can0,oscillator=12000000,interrupt=25
-    dtoverlay=spi-bcm2835-overlay
+    At runtime (matches the TPEE 125 kbps default):
+        sudo ip link set can0 up type can bitrate 125000
+        sudo ifconfig can0 txqueuelen 1000
 
-    # at runtime (or systemd-networkd / interfaces):
-    sudo ip link set can0 up type can bitrate 500000
-    sudo ifconfig can0 txqueuelen 1000
-
-Verify with `ip -details link show can0` and `candump can0`.
+If your BMS is on its own 500 kbps bus and the MPPTs share a 125 kbps bus,
+run two separate CANReaders pointing at can0 and can1.
 """
 
 import can
 
 
 class CANReader:
-    def __init__(self, channel="can0", bitrate=500000, id_allowlist=None,
+    def __init__(self, interface="can0", bitrate=125000, id_to_kind=None,
                  bustype="socketcan"):
         """
-        channel:        SocketCAN interface name, usually 'can0'
-        bitrate:        only used by some bustypes; SocketCAN reads what
-                        the kernel was set to with `ip link`. Kept for
-                        clarity and for non-socketcan backends.
-        id_allowlist:   iterable of CAN IDs (ints) to forward. None or empty
-                        means accept everything. Standard 11-bit IDs and
-                        extended 29-bit IDs are both supported — extended
-                        is auto-detected when ID > 0x7FF.
-        bustype:        python-can interface name. Default 'socketcan'.
+        interface:    SocketCAN device name, e.g. "can0".
+        bitrate:      informational for SocketCAN (the kernel decides), but
+                      python-can records it. 125000 matches the TPEE
+                      standard noted in their wiki; the Pylontech-style BMS
+                      protocol uses 500000 — if both live on the same bus,
+                      pick one and live with it (everyone has to agree).
+        id_to_kind:   dict mapping CAN ID (int) -> kind string.
+                      e.g. {0x20: "mppt", 0x21: "mppt", 0x351: "bms", ...}
+                      Frames whose IDs aren't in this dict are dropped at
+                      the kernel filter level.
+        bustype:      python-can interface name, default "socketcan".
         """
-        self.channel = channel
+        if not id_to_kind:
+            raise ValueError(
+                "CANReader needs an id_to_kind mapping. Pass at least one "
+                "{can_id: kind} entry — empty mapping would accept every "
+                "frame on the bus and overload the LoRa link."
+            )
+
+        self.interface = interface
         self.bitrate = bitrate
-        self.id_allowlist = tuple(id_allowlist) if id_allowlist else ()
+        self.id_to_kind = dict(id_to_kind)
 
-        filters = self._build_filters(self.id_allowlist)
+        filters = self._build_filters(self.id_to_kind.keys())
 
-        # python-can swallowed `bustype` in favour of `interface` in newer
-        # versions but still accepts both — pass `interface` for forward
-        # compatibility.
+        # python-can accepts both `interface` (new) and `bustype` (legacy).
         self.bus = can.interface.Bus(
-            channel=channel,
+            channel=interface,
             interface=bustype,
             bitrate=bitrate,
-            can_filters=filters or None,
+            can_filters=filters,
         )
 
     @staticmethod
     def _build_filters(ids):
-        """Build python-can `can_filters` from an ID allowlist.
-
-        Each filter matches exactly one CAN ID. Extended (29-bit) frames
-        are auto-flagged by ID range.
-        """
-        if not ids:
-            return []
         filters = []
         for can_id in ids:
             extended = can_id > 0x7FF
             filters.append({
-                "can_id": can_id,
+                "can_id": int(can_id),
                 "can_mask": 0x1FFFFFFF if extended else 0x7FF,
                 "extended": extended,
             })
         return filters
 
     def read_frame(self):
-        """Block until a CAN frame arrives, return it as a dict.
-
-        The dict shape mirrors how the BMV reader returns data: a flat
-        thing the normalizer can consume.
-
-        Returns:
-            {
-                "can_id": int,       # 0..0x1FFFFFFF
-                "extended": bool,
-                "dlc": int,          # 0..8 (CAN 2.0; CAN-FD would go higher)
-                "data": bytes,       # exactly dlc bytes
-                "rx_timestamp": float,  # wall-clock seconds, from kernel
-            }
-        """
+        """Block until a relevant frame arrives. Returns (kind, frame_dict)
+        or None if the kernel woke us spuriously."""
         while True:
-            msg = self.bus.recv(timeout=None)  # block forever
+            msg = self.bus.recv(timeout=None)
             if msg is None:
-                # Shouldn't happen with timeout=None, but guard anyway
-                continue
+                return None  # surface to caller, sender loop handles it
             if msg.is_error_frame or msg.is_remote_frame:
                 continue
-            return {
+            kind = self.id_to_kind.get(msg.arbitration_id)
+            if kind is None:
+                # Shouldn't happen given the filters, but be defensive
+                continue
+            frame = {
                 "can_id": msg.arbitration_id,
                 "extended": bool(msg.is_extended_id),
                 "dlc": msg.dlc,
                 "data": bytes(msg.data),
                 "rx_timestamp": msg.timestamp,
             }
+            return kind, frame
 
     def close(self):
         try:
