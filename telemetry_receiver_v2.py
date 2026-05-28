@@ -15,6 +15,7 @@ except AttributeError:
     pass  # Python < 3.7, very unlikely here
 
 from BMV.bmv_handler import format_bmv_packet
+from CAN.can_handler import format_mppt_packet, format_bms_packet
 from LORA.lora_transport import LoRaTransport, extract_hex_payload
 from storage.event_csv_sink import write_event_csv
 from telemetry_packet import MsgType, decode_packet
@@ -422,7 +423,9 @@ def build_transport(args):
 
 def build_handlers(_args):
     return {
-        MsgType.BMV: format_bmv_packet,
+        MsgType.BMV:  format_bmv_packet,
+        MsgType.MPPT: format_mppt_packet,
+        MsgType.BMS:  format_bms_packet,
     }
 
 
