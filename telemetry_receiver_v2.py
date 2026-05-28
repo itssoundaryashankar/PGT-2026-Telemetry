@@ -15,7 +15,6 @@ except AttributeError:
     pass  # Python < 3.7, very unlikely here
 
 from BMV.bmv_handler import format_bmv_packet
-from CAN.can_handler import format_can_packet
 from LORA.lora_transport import LoRaTransport, extract_hex_payload
 from storage.event_csv_sink import write_event_csv
 from telemetry_packet import MsgType, decode_packet
@@ -47,44 +46,18 @@ def _flatten_event(event: dict, prefix: str = "", out: dict | None = None) -> di
 
 
 class InfluxWriter:
-    """Writes decoded telemetry events to InfluxDB v2.
-
-    Routes events to different buckets based on their `msg_type`, falling back
-    to `default_bucket` if no specific mapping is configured. Numeric values
-    are stored as fields; strings/enums become fields too. `msg_type` itself
-    is promoted to a tag so it can be used for fast filtering inside a bucket.
-    """
-
-    def __init__(self, url, token, org, default_bucket, measurement,
-                 bucket_map: dict | None = None):
-        # Imported here so the script still runs without influxdb-client
-        # installed when --influx-enable is not set.
+    def __init__(self, url, token, org, bucket, measurement, bucket_map=None):
         from influxdb_client import InfluxDBClient
         from influxdb_client.client.write_api import SYNCHRONOUS
 
-        self.default_bucket = default_bucket
-        self.bucket_map = dict(bucket_map or {})
+        self.default_bucket = bucket
+        self.bucket_map = bucket_map or {}   # {MsgType.BMV: "BMV-data", ...}
         self.measurement = measurement
         self.client = InfluxDBClient(url=url, token=token, org=org)
         self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
-        if self.bucket_map:
-            mapping_str = ", ".join(f"{k}->{v}" for k, v in self.bucket_map.items())
-            print(f"[influx] Connected to {url}  default_bucket={default_bucket}  "
-                  f"routes={{{mapping_str}}}")
-        else:
-            print(f"[influx] Connected to {url}  bucket={default_bucket}")
-
-    def _bucket_for(self, msg_type) -> str:
-        # Try the enum name first, then the raw value, then string form.
-        if isinstance(msg_type, MsgType):
-            for key in (msg_type.name, msg_type.value):
-                if key in self.bucket_map:
-                    return self.bucket_map[key]
-        if msg_type in self.bucket_map:
-            return self.bucket_map[msg_type]
-        if isinstance(msg_type, str) and msg_type in self.bucket_map:
-            return self.bucket_map[msg_type]
-        return self.default_bucket
+        print(f"[influx] Connected to {url}  default_bucket={bucket}")
+        for msg_type, b in self.bucket_map.items():
+            print(f"[influx]   {msg_type.name} -> bucket={b}")
 
     def write(self, event: dict, tags: dict | None = None):
         if not event:
@@ -97,7 +70,6 @@ class InfluxWriter:
         numeric_fields: dict = {}
         string_fields: dict = {}
         point_tags = dict(tags or {})
-        msg_type_value = None
 
         for k, v in flat.items():
             if v is None:
@@ -106,7 +78,6 @@ class InfluxWriter:
             # msg_type goes into TAGS (not fields) so InfluxDB can index it
             # for fast filtering — that's how you separate BMV / ASCII / etc.
             if k == "msg_type":
-                msg_type_value = v
                 if isinstance(v, MsgType):
                     point_tags["msg_type"] = v.name
                 else:
@@ -137,7 +108,6 @@ class InfluxWriter:
             print(f"[influx] No numeric fields in event, only strings: "
                   f"{list(string_fields.keys())}")
 
-        bucket = self._bucket_for(msg_type_value)
         record = {
             "measurement": self.measurement,
             "tags": point_tags,
@@ -145,9 +115,15 @@ class InfluxWriter:
             "time": datetime.now(timezone.utc),
         }
         try:
+            msg_type = decoded_msg_type = point_tags.get("msg_type")
+            bucket = self.default_bucket
+            for mt, b in self.bucket_map.items():
+                if mt.name == msg_type:
+                    bucket = b
+                    break
             self.write_api.write(bucket=bucket, record=record)
         except Exception as exc:
-            print(f"[influx] Write failed (bucket={bucket}): {exc}")
+            print(f"[influx] Write failed: {exc}")
 
     def close(self):
         try:
@@ -394,7 +370,7 @@ def run_receiver(
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_TRANSPORT = "lora"
-DEFAULT_PORT = "/dev/tty.usbserial-0001"
+DEFAULT_PORT = "COM4"
 DEFAULT_BAUD = 9600
 DEFAULT_FREQ = "868.100"
 DEFAULT_BW = 0
@@ -413,18 +389,12 @@ DEFAULT_CSV_PATH = "received_events.csv"
 
 # InfluxDB defaults — overridable via CLI args or env vars
 DEFAULT_INFLUX_URL = os.getenv("INFLUX_URL", "http://localhost:8086")
-DEFAULT_INFLUX_TOKEN = os.getenv("INFLUX_TOKEN", "")
+DEFAULT_INFLUX_TOKEN = os.getenv("INFLUX_TOKEN", "hwd5R_4oaKX_w3iDdFv_JMcCgmt7CudjQCkeumR6NwPn4AhB_zqOIdcNEi7MWqb8Ac8NR3MHjNmBtrU_oOcOqA==")
 DEFAULT_INFLUX_ORG = os.getenv("INFLUX_ORG", "my-org")
-# Default bucket is used as a fallback for any msg_type without a dedicated
-# bucket configured below.
-DEFAULT_INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "lorawan-data")
-DEFAULT_INFLUX_MEASUREMENT = os.getenv("INFLUX_MEASUREMENT", "telemetry")
-
-# Per-msg-type bucket overrides
+DEFAULT_INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "Default-data")
 DEFAULT_INFLUX_BUCKET_BMV = os.getenv("INFLUX_BUCKET_BMV", "BMV-data")
-DEFAULT_INFLUX_BUCKET_MPPT = os.getenv("INFLUX_BUCKET_MPPT", "CAN-data")
-DEFAULT_INFLUX_BUCKET_BMS = os.getenv("INFLUX_BUCKET_BMS", "CAN-data")
-
+DEFAULT_INFLUX_BUCKET_CAN = os.getenv("INFLUX_BUCKET_CAN", "CAN-data")
+DEFAULT_INFLUX_MEASUREMENT = os.getenv("INFLUX_MEASUREMENT", "telemetry")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # WIRING
@@ -453,8 +423,6 @@ def build_transport(args):
 def build_handlers(_args):
     return {
         MsgType.BMV: format_bmv_packet,
-        MsgType.MPPT: format_can_packet,
-        MsgType.BMS: format_can_packet,
     }
 
 
@@ -471,6 +439,7 @@ def build_sinks(args, influx_writer=None):
     return tuple(sinks)
 
 
+# REPLACE build_influx_writer
 def build_influx_writer(args):
     if not args.influx_enable:
         return None
@@ -479,19 +448,17 @@ def build_influx_writer(args):
               "(use --influx-token or INFLUX_TOKEN env var). Skipping InfluxDB.")
         return None
 
-    # Map known msg_types to their dedicated buckets. Anything not in this
-    # map (e.g. "ASCII" test packets) falls back to default_bucket.
     bucket_map = {
-        "BMV":  args.influx_bucket_bmv,
-        "MPPT": args.influx_bucket_mppt,
-        "BMS":  args.influx_bucket_bms,
+        MsgType.BMV:  args.influx_bucket_bmv,
+        MsgType.MPPT: args.influx_bucket_can,
+        MsgType.BMS:  args.influx_bucket_can,
     }
 
     return InfluxWriter(
         url=args.influx_url,
         token=args.influx_token,
         org=args.influx_org,
-        default_bucket=args.influx_bucket,
+        bucket=args.influx_bucket,       # fallback for unknown/ASCII packets
         measurement=args.influx_measurement,
         bucket_map=bucket_map,
     )
@@ -534,16 +501,11 @@ def build_parser():
     parser.add_argument("--influx-org", default=DEFAULT_INFLUX_ORG,
                         help="InfluxDB v2 organisation (env: INFLUX_ORG)")
     parser.add_argument("--influx-bucket", default=DEFAULT_INFLUX_BUCKET,
-                        help="Default InfluxDB bucket — used for any msg_type "
-                             "without a dedicated bucket (env: INFLUX_BUCKET)")
+                        help="InfluxDB v2 bucket (env: INFLUX_BUCKET)")
     parser.add_argument("--influx-bucket-bmv", default=DEFAULT_INFLUX_BUCKET_BMV,
                         help="InfluxDB bucket for BMV packets (env: INFLUX_BUCKET_BMV)")
-    parser.add_argument("--influx-bucket-mppt", default=DEFAULT_INFLUX_BUCKET_MPPT,
-                        help="InfluxDB bucket for MPPT (CAN) packets "
-                             "(env: INFLUX_BUCKET_MPPT)")
-    parser.add_argument("--influx-bucket-bms", default=DEFAULT_INFLUX_BUCKET_BMS,
-                        help="InfluxDB bucket for BMS (CAN) packets "
-                             "(env: INFLUX_BUCKET_BMS)")
+    parser.add_argument("--influx-bucket-can", default=DEFAULT_INFLUX_BUCKET_CAN,
+                        help="InfluxDB bucket for MPPT and BMS packets (env: INFLUX_BUCKET_CAN)")
     parser.add_argument("--influx-measurement", default=DEFAULT_INFLUX_MEASUREMENT,
                         help="InfluxDB measurement name (env: INFLUX_MEASUREMENT)")
     return parser
