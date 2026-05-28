@@ -422,11 +422,15 @@ def build_parser():
 def _run_in_thread(name, components, transport):
     import threading
 
+    stop_event = threading.Event()
+
     def _target():
-        try:
-            run_sender(**components, transport=transport)
-        except Exception as exc:
-            print(f"[{name}] thread crashed: {exc}", flush=True)
+        while not stop_event.is_set():
+            try:
+                run_sender(**components, transport=transport)
+            except Exception as exc:
+                print(f"[{name}] thread crashed: {exc}, restarting in 5s", flush=True)
+                stop_event.wait(timeout=5.0)
 
     t = threading.Thread(target=_target, name=name, daemon=True)
     t.start()
