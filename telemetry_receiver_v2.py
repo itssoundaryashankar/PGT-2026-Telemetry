@@ -390,7 +390,7 @@ DEFAULT_CSV_PATH = "received_events.csv"
 
 # InfluxDB defaults — overridable via CLI args or env vars
 DEFAULT_INFLUX_URL = os.getenv("INFLUX_URL", "http://localhost:8086")
-DEFAULT_INFLUX_TOKEN = os.getenv("INFLUX_TOKEN", "hwd5R_4oaKX_w3iDdFv_JMcCgmt7CudjQCkeumR6NwPn4AhB_zqOIdcNEi7MWqb8Ac8NR3MHjNmBtrU_oOcOqA==")
+DEFAULT_INFLUX_TOKEN = os.getenv("INFLUX_TOKEN", "")
 DEFAULT_INFLUX_ORG = os.getenv("INFLUX_ORG", "my-org")
 DEFAULT_INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "Default-data")
 DEFAULT_INFLUX_BUCKET_BMV = os.getenv("INFLUX_BUCKET_BMV", "BMV-data")
