@@ -250,12 +250,8 @@ def normalize_bms_frame(raw_frame, device_id):
 # Convenience: default id_to_kind mapping for the CANReader
 # ─────────────────────────────────────────────────────────────────────────────
 
-def default_id_to_kind(num_mppts=5):
-    """Build the default {can_id: kind} dict for one BMS pack + N MPPTs.
-
-    Pass to CANReader(id_to_kind=...).
-    """
-    mapping = {can_id: "bms" for can_id in BMS_IDS}
+def default_id_to_kind(num_mppts=6):
+    mapping = {}
     for i in range(num_mppts):
         mapping[MPPT_BASE_ID + i] = "mppt"
     return mapping
