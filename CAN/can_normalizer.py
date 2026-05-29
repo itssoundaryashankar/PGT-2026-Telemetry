@@ -75,8 +75,8 @@ import time
 # you've got the scale off by 10x. If it prints negative or wildly off, the
 # endianness is reversed.
 
-MPPT_BASE_ID = 0x20
-MPPT_ID_RANGE = range(MPPT_BASE_ID, MPPT_BASE_ID + 5)  # 0x20..0x24 inclusive
+MPPT_BASE_ID = 0x200
+MPPT_ID_RANGE = range(MPPT_BASE_ID, MPPT_BASE_ID + 6)  # 0x200..0x205 for 6 MPPTs
 
 
 def _u16_le(data, offset):
