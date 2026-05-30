@@ -385,7 +385,7 @@ DEFAULT_PREAMBLE = 8
 DEFAULT_SYNCWORD = 0
 DEFAULT_GROUP = 0
 DEFAULT_RX_TIMEOUT = 65535
-DEFAULT_RX_ACK = 2
+DEFAULT_RX_ACK = 0
 DEFAULT_CSV_PATH = "received_events.csv"
 
 # InfluxDB defaults — overridable via CLI args or env vars
