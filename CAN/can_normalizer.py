@@ -6,10 +6,10 @@ Two normalizer functions, both matching the signature the sender expects:
 
 MPPT BYTE LAYOUT — VERIFIED against candump 2026-05-27:
     Frame ID:  0x200 = MPPT #0, 0x201 = MPPT #1, etc.
-    bytes 0-1  pv_voltage_v      LE uint16  * 0.01 V   (confirmed: 1895 -> 18.95V)
-    bytes 2-3  pv_power_w        LE uint16  * 0.01 W   (confirmed: 617  ->  6.17W)
-    bytes 4-5  battery_voltage_v LE uint16  * 0.01 V   (confirmed: 5332 -> 53.32V)
-    bytes 6-7  battery_current_a LE uint16  * 0.1  A   (confirmed: 1    ->  0.1A)
+    bytes 0-1  pv_voltage_v      BE uint16  * 0.01 V   (confirmed: 0x0767 -> 18.95V)
+    bytes 2-3  pv_power_w        BE uint16  * 0.01 W   (confirmed: 0x0269 ->  6.17W)
+    bytes 4-5  battery_voltage_v BE uint16  * 0.01 V   (confirmed: 0x14D4 -> 53.32V)
+    bytes 6-7  battery_current_a LE uint16  * 0.1  A   (confirmed: 0x0100 ->  0.1A)
     pv_current_a is derived: pv_power_w / pv_voltage_v
 
 BMS BYTE LAYOUT — EG4 LL-S in P06-LUX (Pylontech-compatible) mode:
@@ -26,6 +26,10 @@ import time
 
 MPPT_BASE_ID = 0x200
 MPPT_ID_RANGE = range(MPPT_BASE_ID, MPPT_BASE_ID + 6)  # 0x200..0x205 for 6 MPPTs
+
+
+def _u16_be(data, offset):
+    return struct.unpack_from(">H", data, offset)[0]
 
 
 def _u16_le(data, offset):
@@ -52,10 +56,10 @@ def normalize_mppt_frame(raw_frame, device_id):
 
     mppt_index = can_id - MPPT_BASE_ID
 
-    pv_voltage_v      = _u16_le(pad, 0) * 0.01   # bytes 0-1: confirmed 18.95V
-    pv_power_w        = _u16_le(pad, 2) * 0.01   # bytes 2-3: confirmed 6.17W
-    battery_voltage_v = _u16_le(pad, 4) * 0.01   # bytes 4-5: confirmed 53.32V
-    battery_current_a = _u16_le(pad, 6) * 0.1    # bytes 6-7: confirmed 0.1A
+    pv_voltage_v      = _u16_be(pad, 0) * 0.01   # bytes 0-1: big-endian, confirmed 18.95V
+    pv_power_w        = _u16_be(pad, 2) * 0.01   # bytes 2-3: big-endian, confirmed 6.17W
+    battery_voltage_v = _u16_be(pad, 4) * 0.01   # bytes 4-5: big-endian, confirmed 53.32V
+    battery_current_a = _u16_le(pad, 6) * 0.1    # bytes 6-7: little-endian, confirmed 0.1A
     pv_current_a      = round(pv_power_w / pv_voltage_v, 3) if pv_voltage_v > 0 else 0.0
 
     return {
