@@ -5,14 +5,17 @@ import sys
 import time
 from datetime import datetime, timezone
 
-# Force line-buffered stdout so messages appear immediately even when the
-# script is run under an IDE, redirected, or piped (Windows + PowerShell in
-# particular love to switch to block-buffering, which makes the program look
-# stuck during the blocking serial read).f
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except AttributeError:
-    pass  # Python < 3.7, very unlikely here
+    pass
+
+# Fix Windows console encoding
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 from BMV.bmv_handler import format_bmv_packet
 from CAN.can_handler import format_mppt_packet, format_bms_packet
@@ -52,7 +55,7 @@ class InfluxWriter:
         from influxdb_client.client.write_api import SYNCHRONOUS
 
         self.default_bucket = bucket
-        self.bucket_map = bucket_map or {}   # {MsgType.BMV: "BMV-data", ...}
+        self.bucket_map = bucket_map or {}
         self.measurement = measurement
         self.client = InfluxDBClient(url=url, token=token, org=org)
         self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
@@ -64,8 +67,6 @@ class InfluxWriter:
         if not event:
             return
 
-        # Flatten nested dicts so {data: {voltage: 12.5}} becomes
-        # {data_voltage: 12.5} instead of being stringified into oblivion.
         flat = _flatten_event(event)
 
         numeric_fields: dict = {}
@@ -76,24 +77,27 @@ class InfluxWriter:
             if v is None:
                 continue
 
-            # msg_type goes into TAGS (not fields) so InfluxDB can index it
-            # for fast filtering — that's how you separate BMV / ASCII / etc.
+            # Promote these keys to InfluxDB tags for fast filtering
             if k == "msg_type":
                 if isinstance(v, MsgType):
                     point_tags["msg_type"] = v.name
                 else:
                     point_tags["msg_type"] = str(v)
                 continue
+
+            if k == "device_id":
+                point_tags["device_id"] = str(int(v))
+                continue
+
             if k == "mppt_index":
                 point_tags["mppt_index"] = f"mppt_{int(v)}"
                 continue
-            
+
             if isinstance(v, bool):
                 numeric_fields[k] = int(v)
             elif isinstance(v, (int, float)):
                 numeric_fields[k] = float(v)
             elif isinstance(v, str):
-                # Skip the noisy debug strings to avoid cluttering Data Explorer
                 if k in ("payload_hex",):
                     continue
                 string_fields[k] = v
@@ -119,7 +123,7 @@ class InfluxWriter:
             "time": datetime.now(timezone.utc),
         }
         try:
-            msg_type = decoded_msg_type = point_tags.get("msg_type")
+            msg_type = point_tags.get("msg_type")
             bucket = self.default_bucket
             for mt, b in self.bucket_map.items():
                 if mt.name == msg_type:
@@ -145,11 +149,6 @@ def make_influx_sink(writer: InfluxWriter, tags: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 # ASCII FALLBACK DECODER
 # ─────────────────────────────────────────────────────────────────────────────
-#
-# Used when the binary `decode_packet` can't make sense of the bytes (e.g.
-# bench tests where the sender just transmits "67.67"). Mirrors the formats
-# supported by dragino_lora_influx.py: JSON, key=value, bare number, CSV,
-# plain text.
 
 import json
 import re
@@ -162,8 +161,6 @@ def _clean_ascii(text: str) -> str:
 
 
 def decode_ascii_payload(raw: bytes) -> dict | None:
-    """Try to decode `raw` as ASCII telemetry. Returns a decoded event dict
-    on success, or None if the bytes don't look like usable text."""
     if not raw:
         return None
 
@@ -183,7 +180,6 @@ def decode_ascii_payload(raw: bytes) -> dict | None:
         "payload_hex": hex_repr,
     }
 
-    # 1. JSON object
     if text.startswith("{"):
         try:
             obj = json.loads(text)
@@ -197,7 +193,6 @@ def decode_ascii_payload(raw: bytes) -> dict | None:
         except json.JSONDecodeError:
             pass
 
-    # 2. key=value pairs  (e.g. "temp=24.5,hum=60")
     kv = re.findall(r"(\w+)=([-+]?[\d.]+)", text)
     if kv:
         for k, v in kv:
@@ -205,17 +200,15 @@ def decode_ascii_payload(raw: bytes) -> dict | None:
                 event[k.lower()] = float(v)
             except ValueError:
                 pass
-        if len(event) > 3:  # got at least one real field beyond the defaults
+        if len(event) > 3:
             return event
 
-    # 3. Bare number (e.g. "67.67")
     try:
         event["value"] = float(text)
         return event
     except ValueError:
         pass
 
-    # 4. CSV numbers (e.g. "24.5,60.1,3.3")
     parts = [p.strip() for p in text.split(",") if p.strip()]
     if len(parts) >= 2:
         try:
@@ -226,7 +219,6 @@ def decode_ascii_payload(raw: bytes) -> dict | None:
         except ValueError:
             pass
 
-    # 5. Plain text — return with payload field only, no numerics
     return event
 
 
@@ -235,11 +227,6 @@ def decode_ascii_payload(raw: bytes) -> dict | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _looks_decoded(decoded) -> bool:
-    """Heuristic: did the binary decoder actually recognise the packet?
-    We accept only results with a proper MsgType enum — anything else
-    (including a dict with a stray integer 'msg_type') is treated as
-    'binary decoder didn't really know what this was' and we fall
-    through to ASCII."""
     if not isinstance(decoded, dict):
         return False
     return isinstance(decoded.get("msg_type"), MsgType)
@@ -264,14 +251,11 @@ def decode_line(line, extract_payload, decoder, ascii_fallback=True):
         if _looks_decoded(decoded):
             return decoded
 
-    # Fall through to ASCII
     if ascii_fallback:
         ascii_decoded = decode_ascii_payload(packet)
         if ascii_decoded is not None:
             return ascii_decoded
 
-    # Nothing worked — re-raise the original binary error if there was one,
-    # so the caller's existing error message still surfaces.
     if binary_error is not None:
         raise binary_error
     return None
@@ -316,24 +300,23 @@ def run_receiver(
     ascii_fallback=True,
 ):
     print(f"[{log_prefix}] Starting receiver loop", flush=True)
-    print(f"\n📡 Listening for LoRa data — press Ctrl-C to stop\n", flush=True)
+    print(f"\nListening for LoRa data - press Ctrl-C to stop\n", flush=True)
 
     consecutive_errors = 0
-    MAX_CONSECUTIVE_ERRORS = 10  # bail out only after sustained failure
+    MAX_CONSECUTIVE_ERRORS = 10
 
     while True:
         try:
             lines = transport.receive_hex_lines(recv_format=recv_format, wait=wait)
-            consecutive_errors = 0  # reset on any successful poll
+            consecutive_errors = 0
         except RuntimeError as exc:
             consecutive_errors += 1
             print(f"[rx] Modem poll failed ({consecutive_errors}/"
                   f"{MAX_CONSECUTIVE_ERRORS}): {exc}", flush=True)
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                 print(f"[rx] Modem unresponsive for {MAX_CONSECUTIVE_ERRORS} "
-                      f"polls in a row — giving up.", flush=True)
+                      f"polls in a row - giving up.", flush=True)
                 raise
-            # Back off briefly so we don't hammer a confused modem
             time.sleep(min(2.0 * consecutive_errors, 10.0))
             continue
 
@@ -353,10 +336,9 @@ def run_receiver(
                     print(f"[rx-raw] {line}")
                 continue
 
-            # Highly visible "we got something" line, before sinks/handlers run
             msg_type = decoded.get("msg_type")
             type_label = msg_type.name if isinstance(msg_type, MsgType) else str(msg_type)
-            print(f"✅ [{_now_str()}] Received packet  type={type_label}", flush=True)
+            print(f"[{_now_str()}] Received packet  type={type_label}", flush=True)
 
             dispatch_event(decoded, sinks=sinks)
 
@@ -391,14 +373,14 @@ DEFAULT_RX_TIMEOUT = 65535
 DEFAULT_RX_ACK = 0
 DEFAULT_CSV_PATH = "received_events.csv"
 
-# InfluxDB defaults — overridable via CLI args or env vars
 DEFAULT_INFLUX_URL = os.getenv("INFLUX_URL", "http://localhost:8086")
-DEFAULT_INFLUX_TOKEN = os.getenv("INFLUX_TOKEN", "")
+DEFAULT_INFLUX_TOKEN = os.getenv("INFLUX_TOKEN", "C_pCeeM8QagSy6FqWRpYR2ZQeNLr5yxAewGfa0Kdm5jnPBy_Dpf3cD-UMLqQ4A7etWLDCkJi3r_B69EjqHs8AA==")
 DEFAULT_INFLUX_ORG = os.getenv("INFLUX_ORG", "my-org")
 DEFAULT_INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "Default-data")
 DEFAULT_INFLUX_BUCKET_BMV = os.getenv("INFLUX_BUCKET_BMV", "BMV-data")
 DEFAULT_INFLUX_BUCKET_CAN = os.getenv("INFLUX_BUCKET_CAN", "CAN-data")
 DEFAULT_INFLUX_MEASUREMENT = os.getenv("INFLUX_MEASUREMENT", "telemetry")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # WIRING
@@ -436,7 +418,10 @@ def build_sinks(args, influx_writer=None):
     sinks = []
 
     if args.csv_path:
-        sinks.append(lambda event: write_event_csv(args.csv_path, event))
+        sinks.append(
+            lambda event: write_event_csv(args.csv_path, event)
+            if "timestamp" in event else None
+        )
 
     if influx_writer is not None:
         tags = {"source": "telemetry_receiver", "port": args.port}
@@ -445,7 +430,6 @@ def build_sinks(args, influx_writer=None):
     return tuple(sinks)
 
 
-# REPLACE build_influx_writer
 def build_influx_writer(args):
     if not args.influx_enable:
         return None
@@ -464,7 +448,7 @@ def build_influx_writer(args):
         url=args.influx_url,
         token=args.influx_token,
         org=args.influx_org,
-        bucket=args.influx_bucket,       # fallback for unknown/ASCII packets
+        bucket=args.influx_bucket,
         measurement=args.influx_measurement,
         bucket_map=bucket_map,
     )
@@ -486,16 +470,20 @@ def build_parser():
     parser.add_argument("--preamble", type=int, default=DEFAULT_PREAMBLE, help="Preamble length")
     parser.add_argument("--syncword", type=int, default=DEFAULT_SYNCWORD, help="Sync word mode 0/1")
     parser.add_argument("--group", type=int, default=DEFAULT_GROUP, help="Group 0-255")
-    parser.add_argument("--rx-timeout", type=int, default=DEFAULT_RX_TIMEOUT, help="RX window in seconds or 65535 always open")
+    parser.add_argument("--rx-timeout", type=int, default=DEFAULT_RX_TIMEOUT,
+                        help="RX window in seconds or 65535 always open")
     parser.add_argument("--rx-ack", type=int, default=DEFAULT_RX_ACK, help="ACK mode 0/1/2")
-    parser.add_argument("--recv-format", type=int, choices=(0, 1), default=0, help="AT+RECV format 0=hex 1=text")
-    parser.add_argument("--poll", type=float, default=1.0, help="Seconds between AT+RECV polls")
-    parser.add_argument("--csv-path", default=DEFAULT_CSV_PATH, help="CSV output path for decoded events")
-    parser.add_argument("--show-raw", action="store_true", help="Print raw modem receive lines")
+    parser.add_argument("--recv-format", type=int, choices=(0, 1), default=0,
+                        help="AT+RECV format 0=hex 1=text")
+    parser.add_argument("--poll", type=float, default=1.0,
+                        help="Seconds between AT+RECV polls")
+    parser.add_argument("--csv-path", default=DEFAULT_CSV_PATH,
+                        help="CSV output path for decoded events")
+    parser.add_argument("--show-raw", action="store_true",
+                        help="Print raw modem receive lines")
     parser.add_argument("--no-ascii-fallback", action="store_true",
                         help="Disable the ASCII fallback decoder (binary packets only)")
 
-    # InfluxDB options
     parser.add_argument("--influx-enable", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Write decoded events to InfluxDB v2 (on by default; "
