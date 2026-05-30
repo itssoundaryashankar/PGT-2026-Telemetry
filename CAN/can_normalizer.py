@@ -112,11 +112,12 @@ def normalize_mppt_frame(raw_frame, device_id):
     mppt_index = can_id - MPPT_BASE_ID
 
     # TODO: VERIFY all scaling factors / endianness on first deployment.
-    pv_voltage_v       = _u16_le(pad, 0) * 0.01
-    pv_current_a       = _u16_le(pad, 2) * 0.01
-    battery_voltage_v  = _u16_le(pad, 4) * 0.01
-    mosfet_temp_c      = _s16_le(pad, 6) * 0.1
-    pv_power_w         = pv_voltage_v * pv_current_a  # derived, cheap
+    pv_voltage_v      = _u16_le(pad, 0) * 0.01   # bytes 0-1
+    pv_power_w        = _u16_le(pad, 2) * 0.01   # bytes 2-3
+    battery_voltage_v = _u16_le(pad, 4) * 0.01   # bytes 4-5
+    battery_current_a = _u16_le(pad, 6) * 0.1    # bytes 6-7
+    pv_current_a      = round(pv_power_w / pv_voltage_v, 3) if pv_voltage_v > 0 else 0.0  # derived
+    mosfet_temp_c     = 0.0  # not present in this frame layout
 
     return {
         "device_type": "mppt",
