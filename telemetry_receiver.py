@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 # Force line-buffered stdout so messages appear immediately even when the
 # script is run under an IDE, redirected, or piped (Windows + PowerShell in
 # particular love to switch to block-buffering, which makes the program look
-# stuck during the blocking serial read).
+# stuck during the blocking serial read).f
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except AttributeError:
@@ -84,7 +84,10 @@ class InfluxWriter:
                 else:
                     point_tags["msg_type"] = str(v)
                 continue
-
+            if k == "mppt_index":
+                point_tags["mppt_index"] = f"mppt_{int(v)}"
+                continue
+            
             if isinstance(v, bool):
                 numeric_fields[k] = int(v)
             elif isinstance(v, (int, float)):
