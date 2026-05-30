@@ -18,12 +18,12 @@ from telemetry_packet import build_bmv_packet
 
 DEFAULT_DEVICE = "all"
 DEFAULT_TRANSPORT = "lora"
-DEFAULT_BMV_PORT = "/dev/ttyUSB1"
+DEFAULT_BMV_PORT = "/dev/tty.usbserial-VE7ALZXZ"
 DEFAULT_BMV_BAUD = 19200
 DEFAULT_CSV_PATH = "bmv_data.csv"
 DEFAULT_DEVICE_ID = 1
 
-DEFAULT_LORA_PORT = "/dev/ttyUSB0"
+DEFAULT_LORA_PORT = "/dev/tty.usbserial-0002"
 DEFAULT_LORA_BAUD = 9600
 DEFAULT_FREQ = "868.100"
 DEFAULT_BW = 0
@@ -46,8 +46,8 @@ DEFAULT_HEARTBEAT_SECONDS = 60
 
 # CAN defaults
 DEFAULT_CAN_INTERFACE = "can0"
-DEFAULT_CAN_BITRATE = 500000   
-DEFAULT_MPPT_DEVICE_ID = 10   
+DEFAULT_CAN_BITRATE = 125000   # TPEE wiki default; switch to 500000 if your BMS forces it
+DEFAULT_MPPT_DEVICE_ID = 10    # MPPT #0 -> 10, MPPT #1 -> 11, ...
 DEFAULT_BMS_DEVICE_ID = 20
 DEFAULT_MPPT_HEARTBEAT_SECONDS = 60
 DEFAULT_BMS_HEARTBEAT_SECONDS = 60
@@ -422,15 +422,11 @@ def build_parser():
 def _run_in_thread(name, components, transport):
     import threading
 
-    stop_event = threading.Event()
-
     def _target():
-        while not stop_event.is_set():
-            try:
-                run_sender(**components, transport=transport)
-            except Exception as exc:
-                print(f"[{name}] thread crashed: {exc}, restarting in 5s", flush=True)
-                stop_event.wait(timeout=5.0)
+        try:
+            run_sender(**components, transport=transport)
+        except Exception as exc:
+            print(f"[{name}] thread crashed: {exc}", flush=True)
 
     t = threading.Thread(target=_target, name=name, daemon=True)
     t.start()
