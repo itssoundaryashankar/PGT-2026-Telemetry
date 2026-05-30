@@ -39,7 +39,7 @@ import time
 # MPPT — TPEE Open-SEC authoritative layout
 # ─────────────────────────────────────────────────────────────────────────────
 
-MPPT_BASE_DEVICE_ID = 32
+MPPT_BASE_DEVICE_ID = 1
 NUM_MPPTS = 6
 
 MPPT_POWER_IDS  = [((MPPT_BASE_DEVICE_ID + i) << 4) | 0 for i in range(NUM_MPPTS)]
