@@ -4,12 +4,13 @@
 Two normalizer functions, both matching the signature the sender expects:
     normalize_xxx_frame(raw_frame: dict, device_id: int) -> dict
 
-MPPT BYTE LAYOUT — VERIFIED against candump 2026-05-27:
+MPPT BYTE LAYOUT — VERIFIED against candump:
     Frame ID:  0x200 = MPPT #0, 0x201 = MPPT #1, etc.
-    bytes 0-1  pv_voltage_v      BE uint16  * 0.01 V   (confirmed: 0x0767 -> 18.95V)
-    bytes 2-3  pv_power_w        BE uint16  * 0.01 W   (confirmed: 0x0269 ->  6.17W)
-    bytes 4-5  battery_voltage_v BE uint16  * 0.01 V   (confirmed: 0x14D4 -> 53.32V)
-    bytes 6-7  battery_current_a LE uint16  * 0.1  A   (confirmed: 0x0100 ->  0.1A)
+    bytes 0-1  pv_voltage_v      BE uint16  * 0.01 V   (confirmed: 0x0781 -> 19.21V)
+    bytes 2-3  pv_power_w        BE uint16  * 0.01 W   (confirmed: 0x02E5 ->  7.41W)
+    bytes 4-5  battery_voltage_v BE uint16  * 0.01 V   (confirmed: 0x14E9 -> 53.53V)
+    byte  6    battery_current_a uint8      * 0.1  A   (confirmed: 0x01   ->  0.1A)
+    byte  7    status_byte       uint8      raw         (unknown, stored for debugging)
     pv_current_a is derived: pv_power_w / pv_voltage_v
 
 BMS BYTE LAYOUT — EG4 LL-S in P06-LUX (Pylontech-compatible) mode:
@@ -56,10 +57,11 @@ def normalize_mppt_frame(raw_frame, device_id):
 
     mppt_index = can_id - MPPT_BASE_ID
 
-    pv_voltage_v      = _u16_be(pad, 0) * 0.01   # bytes 0-1: big-endian, confirmed 18.95V
-    pv_power_w        = _u16_be(pad, 2) * 0.01   # bytes 2-3: big-endian, confirmed 6.17W
-    battery_voltage_v = _u16_be(pad, 4) * 0.01   # bytes 4-5: big-endian, confirmed 53.32V
-    battery_current_a = _u16_le(pad, 6) * 0.1    # bytes 6-7: little-endian, confirmed 0.1A
+    pv_voltage_v      = _u16_be(pad, 0) * 0.01   # bytes 0-1 BE: confirmed ~19V
+    pv_power_w        = _u16_be(pad, 2) * 0.01   # bytes 2-3 BE: confirmed ~7W
+    battery_voltage_v = _u16_be(pad, 4) * 0.01   # bytes 4-5 BE: confirmed ~53V
+    battery_current_a = pad[6] * 0.1             # byte 6 only: confirmed 0.1A
+    status_byte       = pad[7]                   # byte 7: unknown, stored raw
     pv_current_a      = round(pv_power_w / pv_voltage_v, 3) if pv_voltage_v > 0 else 0.0
 
     return {
@@ -73,6 +75,7 @@ def normalize_mppt_frame(raw_frame, device_id):
             "pv_current_a":      pv_current_a,
             "battery_voltage_v": battery_voltage_v,
             "battery_current_a": battery_current_a,
+            "status_byte":       float(status_byte),
             "raw_hex":           pad.hex(),
         },
     }
