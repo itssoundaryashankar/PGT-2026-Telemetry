@@ -383,7 +383,7 @@ def build_parser():
                         help="MPPT: PV voltage change to trigger transmit (V)")
     parser.add_argument("--mppt-pv-current-delta-a", type=float, default=0.5,
                         help="MPPT: PV current change to trigger transmit (A)")
-    parser.add_argument("--mppt-pv-power-delta-w", type=float, default=20.0,
+    parser.add_argument("--mppt-pv-power-delta-w", type=float, default=1.0,
                         help="MPPT: PV power change to trigger transmit (W)")
     parser.add_argument("--mppt-batt-voltage-delta-v", type=float, default=0.2,
                         help="MPPT: battery voltage change to trigger transmit (V)")
