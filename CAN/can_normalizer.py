@@ -3,32 +3,20 @@
 
 TPEE Open-SEC CAN protocol — authoritative source: OpenSEC Manual V1.9
 
-CAN ID formula:  can_id = (device_id << 4) | packet_id
-Default device ID = 32 (0x20), encoder = 0, so:
-    MPPT #0: power=0x200, status=0x201
-    MPPT #1: power=0x210, status=0x211
-    MPPT #2: power=0x220, status=0x221
-    MPPT #3: power=0x230, status=0x231
-    MPPT #4: power=0x240, status=0x241
-    MPPT #5: power=0x250, status=0x251
+CAN ID formula:  can_id = (effective_device_id << 4) | packet_id
+where effective_device_id = Reboost tool device ID + physical encoder value
 
-Packet ID 0 — Power Measurements (every 0.5s, 8 bytes):
-    bytes 0-1  input_voltage_v    INT16 BE  * 0.01    V    (PV panel voltage)
-    bytes 2-3  input_current_a    INT16 BE  * 0.0005  A    (PV panel current)
-    bytes 4-5  output_voltage_v   INT16 BE  * 0.01    V    (battery voltage)
-    bytes 6-7  output_current_a   INT16 BE  * 0.0005  A    (battery current)
+────────────────────────────────────────────────────────────────────
+CONFIGURATION — update this list when adding/changing MPPTs
+────────────────────────────────────────────────────────────────────
+Each entry is the *effective* device ID = Reboost ID + encoder value.
+To find it: take the CAN ID from candump, shift right 4 bits.
+e.g. candump shows 0x020 -> 0x020 >> 4 = 2
+     candump shows 0x100 -> 0x100 >> 4 = 16
 
-Packet ID 1 — Status (every 1.0s, 5 bytes):
-    byte  0    mode       UINT8  (0=Const Vin, 1=Const Iin, 2=Min Iin,
-                                  3=Const Vout, 4=Const Iout,
-                                  5=Temp Derating, 6=Fault)
-    byte  1    fault      UINT8  (0=OK, 1=Config, 2=In OV, 3=Out OV,
-                                  4=Out OC, 5=In OC, 6=In UC, 7=Phase OC)
-    byte  2    enabled    UINT8  (0=Disabled, 1=Enabled)
-    byte  3    ambient_temp_c   INT8  * 1 C
-    byte  4    heatsink_temp_c  INT8  * 1 C
-
-BMS BYTE LAYOUT — EG4 LL-S in P06-LUX (Pylontech-compatible) mode.
+The order of this list determines mppt_index (0, 1, 2 ...) and
+therefore InfluxDB device_id (base + index).
+────────────────────────────────────────────────────────────────────
 """
 
 import struct
@@ -36,15 +24,38 @@ import time
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MPPT — TPEE Open-SEC authoritative layout
+# *** EDIT THIS LIST TO ADD / CHANGE MPPTs ***
+#
+# Add effective device IDs in the order you want them indexed.
+# To find an effective device ID: candump can0, take the 8-byte frame ID,
+# shift right 4 bits. e.g. 0x020 >> 4 = 2, 0x100 >> 4 = 16.
 # ─────────────────────────────────────────────────────────────────────────────
 
-MPPT_BASE_DEVICE_ID = 1
-NUM_MPPTS = 6
+MPPT_EFFECTIVE_IDS = [
+    2,   # MPPT #0 — Reboost ID 2  (CAN power=0x020, status=0x021)
+    16,  # MPPT #1 — Reboost ID 1 + encoder 15 = 16 (CAN power=0x100, status=0x101)
+    # Add more here as you connect them, e.g.:
+    # 3,   # MPPT #2 — Reboost ID 3  (CAN power=0x030, status=0x031)
+    # 4,   # MPPT #3 — Reboost ID 4  (CAN power=0x040, status=0x041)
+    # 5,   # MPPT #4 — Reboost ID 5  (CAN power=0x050, status=0x051)
+    # 6,   # MPPT #5 — Reboost ID 6  (CAN power=0x060, status=0x061)
+]
 
-MPPT_POWER_IDS  = [((MPPT_BASE_DEVICE_ID + i) << 4) | 0 for i in range(NUM_MPPTS)]
-MPPT_STATUS_IDS = [((MPPT_BASE_DEVICE_ID + i) << 4) | 1 for i in range(NUM_MPPTS)]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Derived ID sets — do not edit, computed automatically from MPPT_EFFECTIVE_IDS
+# ─────────────────────────────────────────────────────────────────────────────
+
+MPPT_POWER_IDS  = [(eid << 4) | 0 for eid in MPPT_EFFECTIVE_IDS]
+MPPT_STATUS_IDS = [(eid << 4) | 1 for eid in MPPT_EFFECTIVE_IDS]
 MPPT_ALL_IDS    = set(MPPT_POWER_IDS + MPPT_STATUS_IDS)
+
+# Reverse lookup: can_id -> mppt_index
+_CAN_ID_TO_INDEX = {
+    (eid << 4) | pkt_id: idx
+    for idx, eid in enumerate(MPPT_EFFECTIVE_IDS)
+    for pkt_id in (0, 1)
+}
 
 FAULT_NAMES = {
     0: "OK",
@@ -79,18 +90,26 @@ def _s8(data, offset):
 def normalize_mppt_frame(raw_frame, device_id):
     """Decode one TPEE Open-SEC frame (power or status).
 
-    device_id is the fleet-wide MPPT base. Board index (0..5) is added
-    so each board appears as a distinct device_id in InfluxDB.
+    device_id is the fleet-wide MPPT base. mppt_index (0-based position
+    in MPPT_EFFECTIVE_IDS) is added so each board gets a unique device_id
+    in InfluxDB.
     """
     can_id = raw_frame["can_id"]
     data = raw_frame["data"]
     pad = bytes(data) + b"\x00" * (8 - len(data)) if len(data) < 8 else bytes(data)
 
-    mppt_index = (can_id >> 4) - MPPT_BASE_DEVICE_ID
-    packet_id  = can_id & 0x0F
+    mppt_index = _CAN_ID_TO_INDEX.get(can_id)
+    if mppt_index is None:
+        raise ValueError(
+            f"normalize_mppt_frame: CAN ID 0x{can_id:X} not in MPPT_EFFECTIVE_IDS. "
+            f"Add effective device ID {can_id >> 4} to MPPT_EFFECTIVE_IDS."
+        )
+
+    packet_id = can_id & 0x0F
 
     if packet_id == 0:
-        # Power measurements — 8 bytes, all signed INT16 big-endian
+        # Packet ID 0 — Power measurements (every 0.5s, 8 bytes)
+        # All signed INT16 big-endian per OpenSEC Manual V1.9
         input_voltage_v  = _s16_be(pad, 0) * 0.01
         input_current_a  = _s16_be(pad, 2) * 0.0005
         output_voltage_v = _s16_be(pad, 4) * 0.01
@@ -106,7 +125,7 @@ def normalize_mppt_frame(raw_frame, device_id):
         }
 
     elif packet_id == 1:
-        # Status — 5 bytes
+        # Packet ID 1 — Status (every 1.0s, 5 bytes)
         mode            = pad[0]
         fault           = pad[1]
         enabled         = pad[2]
@@ -229,13 +248,14 @@ def normalize_bms_frame(raw_frame, device_id):
 # Convenience: default id_to_kind mapping for the CANReader
 # ─────────────────────────────────────────────────────────────────────────────
 
-def default_id_to_kind(num_mppts=NUM_MPPTS):
-    """Build the {can_id: kind} dict for one BMS pack + N MPPTs.
+def default_id_to_kind(num_mppts=None):
+    """Build the {can_id: kind} dict from MPPT_EFFECTIVE_IDS + BMS_IDS.
 
-    Includes both power (packet 0) and status (packet 1) for each MPPT.
+    num_mppts is ignored — all IDs in MPPT_EFFECTIVE_IDS are always included.
+    The parameter is kept for backwards compatibility only.
     """
     mapping = {can_id: "bms" for can_id in BMS_IDS}
-    for i in range(num_mppts):
-        mapping[((MPPT_BASE_DEVICE_ID + i) << 4) | 0] = "mppt"
-        mapping[((MPPT_BASE_DEVICE_ID + i) << 4) | 1] = "mppt"
+    for eid in MPPT_EFFECTIVE_IDS:
+        mapping[(eid << 4) | 0] = "mppt"  # power frame
+        mapping[(eid << 4) | 1] = "mppt"  # status frame
     return mapping
