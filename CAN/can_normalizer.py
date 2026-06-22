@@ -31,15 +31,7 @@ import time
 # shift right 4 bits. e.g. 0x020 >> 4 = 2, 0x100 >> 4 = 16.
 # ─────────────────────────────────────────────────────────────────────────────
 
-MPPT_EFFECTIVE_IDS = [
-    2,   # MPPT #0 — Reboost ID 2  (CAN power=0x020, status=0x021)
-    16,  # MPPT #1 — Reboost ID 1 + encoder 15 = 16 (CAN power=0x100, status=0x101)
-    # Add more here as you connect them, e.g.:
-    # 3,   # MPPT #2 — Reboost ID 3  (CAN power=0x030, status=0x031)
-    # 4,   # MPPT #3 — Reboost ID 4  (CAN power=0x040, status=0x041)
-    # 5,   # MPPT #4 — Reboost ID 5  (CAN power=0x050, status=0x051)
-    # 6,   # MPPT #5 — Reboost ID 6  (CAN power=0x060, status=0x061)
-]
+MPPT_EFFECTIVE_IDS = [1, 3, 4, 5, 17]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
