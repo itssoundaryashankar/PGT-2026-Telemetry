@@ -213,6 +213,20 @@ def _build_typed_packet(normalized, event_type, seq, msg_type, layout,
         if extra in normalized and extra not in fields:
             fields[extra] = normalized[extra]
 
+    # MPPT identity contract: every MPPT reading must carry an mppt_index so
+    # the receiver can separate the five boards. can_normalizer.py is the
+    # authoritative source — it sets both mppt_index and the per-board
+    # device_id (base + index) from the frame's position in MPPT_EFFECTIVE_IDS.
+    # This is only a fail-fast guard against a normalizer regression that would
+    # otherwise silently collapse all boards onto one InfluxDB series.
+    if msg_type == MsgType.MPPT:
+        if fields.get("mppt_index", normalized.get("mppt_index")) is None:
+            raise ValueError(
+                "MPPT reading has no mppt_index; can_normalizer must set it "
+                "from the frame's position in MPPT_EFFECTIVE_IDS so the "
+                "receiver can distinguish the boards"
+            )
+
     field_mask = 0
     payload = bytearray()
 
