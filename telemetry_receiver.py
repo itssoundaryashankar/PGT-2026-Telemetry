@@ -90,7 +90,7 @@ class InfluxWriter:
                 continue
 
             if k == "mppt_index":
-                point_tags["mppt_index"] = f"mppt_{int(v)}"
+                point_tags["mppt_index"] = f"MPPT_{int(v) + 1}"
                 continue
 
             if isinstance(v, bool):
