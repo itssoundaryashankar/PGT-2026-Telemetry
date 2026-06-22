@@ -55,12 +55,24 @@ class GenericTransmitPolicy:
 
     @staticmethod
     def _keys(reading):
-        # Default source key is device_id. For BMS, the slot key is the
-        # CAN ID — different IDs carry different fields. For everything
-        # else (MPPT collapses everything into one frame), one slot per
-        # source.
+        # Default source key is device_id. The slot key must separate frames
+        # that carry disjoint field sets within one source, otherwise they
+        # overwrite each other's last-sent state and the delta thresholds are
+        # never meaningfully compared.
+        #
+        #   - BMS: different CAN IDs carry different fields (SOC on 0x355,
+        #     voltage on 0x356), keyed by can_id_hex.
+        #   - MPPT: power (packet_id 0) and status (packet_id 1) frames carry
+        #     disjoint fields and arrive at different rates; keyed by packet_id.
+        #   - Anything else collapses to a single slot per source.
         src = reading["device_id"]
-        slot = reading["fields"].get("can_id_hex", "_only")
+        fields = reading["fields"]
+        if "can_id_hex" in fields:
+            slot = fields["can_id_hex"]
+        elif reading.get("packet_id") is not None:
+            slot = f"pkt{reading['packet_id']}"
+        else:
+            slot = "_only"
         return src, slot
 
     def classify(self, reading):
