@@ -18,7 +18,7 @@ from telemetry_packet import build_bmv_packet
 
 DEFAULT_DEVICE = "all"
 DEFAULT_TRANSPORT = "lora"
-DEFAULT_BMV_PORT = "/dev/tty.usbserial-VE7ALZXZ"
+DEFAULT_BMV_PORT = "/dev/ttyUSB0"
 DEFAULT_BMV_BAUD = 19200
 DEFAULT_CSV_PATH = "bmv_data.csv"
 DEFAULT_DEVICE_ID = 1
