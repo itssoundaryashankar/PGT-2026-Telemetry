@@ -85,7 +85,7 @@ class MPPTField(IntEnum):
 MPPT_FIELD_LAYOUT = (
     (MPPTField.PV_VOLTAGE_V,      "pv_voltage_v",      ">H"),
     (MPPTField.PV_CURRENT_A,      "pv_current_a",      ">h"),
-    (MPPTField.PV_POWER_W,        "pv_power_w",        ">H"),
+    (MPPTField.PV_POWER_W,        "pv_power_w",        ">h"),
     (MPPTField.BATTERY_VOLTAGE_V, "battery_voltage_v", ">H"),
     (MPPTField.BATTERY_CURRENT_A, "battery_current_a", ">h"),
     (MPPTField.MODE,              "mode",              ">B"),
