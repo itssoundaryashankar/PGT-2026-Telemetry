@@ -138,7 +138,16 @@ class GenericTransmitPolicy:
             if prev is None:
                 return True
             try:
-                if abs(float(cur) - float(prev)) >= threshold:
+                cur_f = float(cur)
+                prev_f = float(prev)
+                # Zero-crossing: any watched field transitioning to or from
+                # zero is always treated as a significant change regardless
+                # of the configured delta threshold. This ensures a panel
+                # disconnect (pv_power_w -> 0) is transmitted immediately
+                # rather than waiting for the heartbeat interval.
+                if (cur_f == 0.0) != (prev_f == 0.0):
+                    return True
+                if abs(cur_f - prev_f) >= threshold:
                     return True
             except (TypeError, ValueError):
                 # Non-numeric watched field — fall back to equality
