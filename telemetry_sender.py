@@ -53,7 +53,7 @@ DEFAULT_MPPT_HEARTBEAT_SECONDS = 60
 DEFAULT_BMS_HEARTBEAT_SECONDS = 60
 DEFAULT_CSV_PATH_MPPT = "mppt_data.csv"
 DEFAULT_CSV_PATH_BMS = "bms_data.csv"
-DEFAULT_NUM_MPPTS = 5
+DEFAULT_NUM_MPPTS = 6
 
 
 # ─────────────────────────────────────────────────────────────────────────────
