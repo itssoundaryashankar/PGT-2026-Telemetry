@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import sys
+import time
 
 # Make stdout line-buffered so logs appear immediately on Windows / piped runs.
 try:
@@ -45,6 +46,12 @@ DEFAULT_POWER_DELTA_W = 10
 DEFAULT_HEARTBEAT_SECONDS = 60
 
 # CAN defaults
+# Frames older than this are discarded rather than transmitted. When the LoRa
+# modem is busy (one TX blocks ~1s+), CAN frames accumulate in the kernel
+# buffer. Without this guard the sender would transmit a backlog of stale
+# readings, causing InfluxDB to show data that is many seconds out of date.
+MAX_FRAME_AGE_SECONDS = 3
+
 DEFAULT_CAN_INTERFACE = "can0"
 DEFAULT_CAN_BITRATE = 500000
 DEFAULT_MPPT_DEVICE_ID = 1    # MPPT #0 -> 10, MPPT #1 -> 11, ...
@@ -67,6 +74,26 @@ def _process_reading(components, raw_frame, transport, log_prefix):
     device_id = components["device_id"]
     sink = components.get("sink")
     sub_prefix = components.get("log_prefix", log_prefix)
+
+    # Staleness guard: CAN frames carry a hardware rx_timestamp. When the LoRa
+    # modem is busy transmitting (send_hex blocks for ~1s+ per packet), frames
+    # pile up in the kernel CAN buffer. By the time we dequeue them they may be
+    # seconds old. Transmitting stale readings would make InfluxDB show data
+    # that lags real-world conditions by many seconds. We discard any frame
+    # whose rx_timestamp is older than MAX_FRAME_AGE_SECONDS and let the
+    # heartbeat handle the next transmission once the modem is free.
+    # BMV frames have no rx_timestamp, so they are never dropped here.
+    if isinstance(raw_frame, dict):
+        rx_ts = raw_frame.get("rx_timestamp")
+        if rx_ts is not None:
+            age = time.time() - rx_ts
+            if age > MAX_FRAME_AGE_SECONDS:
+                print(
+                    f"[{sub_prefix}] Dropping stale CAN frame "
+                    f"(age={age:.1f}s > {MAX_FRAME_AGE_SECONDS}s)",
+                    flush=True,
+                )
+                return
 
     try:
         reading = normalizer(raw_frame, device_id)
