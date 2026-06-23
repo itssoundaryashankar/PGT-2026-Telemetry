@@ -18,12 +18,12 @@ from telemetry_packet import build_bmv_packet
 
 DEFAULT_DEVICE = "all"
 DEFAULT_TRANSPORT = "lora"
-DEFAULT_BMV_PORT = "/dev/ttyUSB0"
+DEFAULT_BMV_PORT = "/dev/serial/by-id/usb-VictronEnergy_BV_VE_Direct_cable_VE92RZNP-if00-port0"
 DEFAULT_BMV_BAUD = 19200
 DEFAULT_CSV_PATH = "bmv_data.csv"
 DEFAULT_DEVICE_ID = 1
 
-DEFAULT_LORA_PORT = "/dev/ttyUSB1"
+DEFAULT_LORA_PORT = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0"
 DEFAULT_LORA_BAUD = 9600
 DEFAULT_FREQ = "868.100"
 DEFAULT_BW = 0
