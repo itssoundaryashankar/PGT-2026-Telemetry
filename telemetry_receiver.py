@@ -291,7 +291,7 @@ def run_receiver(
     decoder,
     extract_payload,
     recv_format=0,
-    poll_interval=1.0,
+    poll_interval=0.2,
     wait=0.3,
     show_raw=False,
     handlers=None,
