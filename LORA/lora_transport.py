@@ -166,11 +166,10 @@ class LoRaTransport:
 
     def send_wait_time(self):
         if self.ack == 0:
-            # Air time at BW=125 kHz ≈ symbol_time × ~50 symbols.
-            # Add 150 ms margin so the modem has time to respond after TX.
-            # Scales correctly with SF: SF9 ≈ 360 ms, SF12 ≈ 1800 ms.
-            # The old hardcoded 1.0 s wasted ~640 ms per packet at SF9 and
-            # was actually too short at SF12 (air time ~1.6 s).
+            # Time-on-air at BW=125 kHz = symbol_time × ~50 symbols.
+            # Add 150 ms margin for the modem to respond after TX completes.
+            # SF9  → ~205 ms air time → 355 ms wait  (was hardcoded 1000 ms)
+            # SF12 → ~1638 ms air time → 1788 ms wait (was too short at 1000 ms)
             symbol_time_s = (2 ** self.sf) / 125_000
             return max(0.3, symbol_time_s * 50 + 0.15)
         return 1.5 + (self.retries * 5.5)
