@@ -51,7 +51,7 @@ DEFAULT_CAN_INTERFACE = "can0"
 DEFAULT_CAN_BITRATE = 500000
 DEFAULT_MPPT_DEVICE_ID = 1
 DEFAULT_BMS_DEVICE_ID = 20
-DEFAULT_MPPT_HEARTBEAT_SECONDS = 60
+DEFAULT_MPPT_HEARTBEAT_SECONDS = 5
 DEFAULT_BMS_HEARTBEAT_SECONDS = 60
 DEFAULT_CSV_PATH_MPPT = "mppt_data.csv"
 DEFAULT_CSV_PATH_BMS = "bms_data.csv"
@@ -60,8 +60,8 @@ DEFAULT_NUM_MPPTS = 6
 # How often the CAN transmit thread wakes up to check for changes (seconds).
 # Pkt0 (power) is checked every tick; pkt1 (status) every STATUS_TICKS ticks
 # to prioritize power data over mode/fault/temp on the LoRa link.
-CAN_SAMPLE_INTERVAL = 1.0
-STATUS_TICKS = 5  # transmit status frames at most once per 5 × 1s = 5s
+CAN_SAMPLE_INTERVAL = 0.0
+STATUS_TICKS = 15  # transmit status frames at most once per 5 × 1s = 5s
 
 
 # ─────────────────────────────────────────────────────────────────────────────
