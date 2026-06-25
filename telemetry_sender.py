@@ -61,7 +61,7 @@ DEFAULT_NUM_MPPTS = 6
 # Pkt0 (power) is checked every tick; pkt1 (status) every STATUS_TICKS ticks
 # to prioritize power data over mode/fault/temp on the LoRa link.
 CAN_SAMPLE_INTERVAL = 1.0
-STATUS_TICKS = 5  # transmit status frames at most once per 5 × 3s = 15s
+STATUS_TICKS = 5  # transmit status frames at most once per 5 × 1s = 5s
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -75,7 +75,7 @@ def _process_reading(components, raw_frame, transport, log_prefix):
     device_id = components["device_id"]
     sink = components.get("sink")
     sub_prefix = components.get("log_prefix", log_prefix)
-    
+
     try:
         reading = normalizer(raw_frame, device_id)
     except Exception as exc:
@@ -99,12 +99,6 @@ def _process_reading(components, raw_frame, transport, log_prefix):
         print(f"[{sub_prefix}] Packet build failed: {exc}", flush=True)
         return
 
-    try:
-        t0 = time.time()
-        transport.send_hex(packet.hex())
-        print(f"[{sub_prefix}] TX took {time.time()-t0:.2f}s", flush=True)
-    except Exception as exc:
-        
     if transport is None:
         print(
             f"[{sub_prefix}] {event_type.name} seq={seq} "
@@ -114,16 +108,16 @@ def _process_reading(components, raw_frame, transport, log_prefix):
         return
 
     try:
+        t0 = time.time()
         transport.send_hex(packet.hex())
+        print(
+            f"[{sub_prefix}] Sent {event_type.name} seq={seq} "
+            f"tx={time.time()-t0:.2f}s fields={reading['fields']}",
+            flush=True,
+        )
     except Exception as exc:
         print(f"[{sub_prefix}] Transport send failed: {exc}", flush=True)
         return
-
-    print(
-        f"[{sub_prefix}] Sent {event_type.name} seq={seq} "
-        f"fields={reading['fields']}",
-        flush=True,
-    )
 
 
 def run_sender(
