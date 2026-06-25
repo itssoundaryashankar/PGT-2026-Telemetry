@@ -54,7 +54,7 @@ def try_probe_modem(ser):
 
 def open_serial(port, baud):
     ser = serial.Serial(port, baud, timeout=0.5)
-    time.sleep(0.5)
+    time.sleep(2.0)  # LA66 needs ~1-2s to boot before accepting AT commands
     ser.reset_input_buffer()
     ser.reset_output_buffer()
     return ser
@@ -123,6 +123,7 @@ class LoRaTransport:
         ser = self._require_serial()
         reset_required = False
         try_probe_modem(ser)
+        time.sleep(0.5)  # let probe response fully clear before sending config commands
         reset_required |= needs_reset(require_ok(ser, f"AT+FRE={self.freq},{self.freq}"))
         reset_required |= needs_reset(require_ok(ser, f"AT+BW={self.bw},{self.bw}"))
         reset_required |= needs_reset(require_ok(ser, f"AT+SF={self.sf},{self.sf}"))
@@ -166,12 +167,7 @@ class LoRaTransport:
 
     def send_wait_time(self):
         if self.ack == 0:
-            # Time-on-air at BW=125 kHz = symbol_time × ~50 symbols.
-            # Add 150 ms margin for the modem to respond after TX completes.
-            # SF9  → ~205 ms air time → 355 ms wait  (was hardcoded 1000 ms)
-            # SF12 → ~1638 ms air time → 1788 ms wait (was too short at 1000 ms)
-            symbol_time_s = (2 ** self.sf) / 125_000
-            return max(0.3, symbol_time_s * 50 + 0.15)
+            return 1.0
         return 1.5 + (self.retries * 5.5)
 
     def _require_serial(self):
