@@ -412,13 +412,13 @@ def build_parser():
     # MPPT
     parser.add_argument("--mppt-device-id", type=int, default=DEFAULT_MPPT_DEVICE_ID,
                         help="Base telemetry device id for MPPT #0; #1 -> base+1, etc.")
-    parser.add_argument("--mppt-pv-voltage-delta-v", type=float, default=1.0,
+    parser.add_argument("--mppt-pv-voltage-delta-v", type=float, default=2.0,
                         help="MPPT: PV voltage change to trigger transmit (V)")
-    parser.add_argument("--mppt-pv-current-delta-a", type=float, default=0.2,
+    parser.add_argument("--mppt-pv-current-delta-a", type=float, default=0.5,
                         help="MPPT: PV current change to trigger transmit (A)")
-    parser.add_argument("--mppt-pv-power-delta-w", type=float, default=5.0,
+    parser.add_argument("--mppt-pv-power-delta-w", type=float, default=10.0,
                         help="MPPT: PV power change to trigger transmit (W)")
-    parser.add_argument("--mppt-batt-voltage-delta-v", type=float, default=0.5,
+    parser.add_argument("--mppt-batt-voltage-delta-v", type=float, default=1.0,
                         help="MPPT: battery voltage change to trigger transmit (V)")
     parser.add_argument("--mppt-heartbeat-seconds", type=int, default=DEFAULT_MPPT_HEARTBEAT_SECONDS)
 
