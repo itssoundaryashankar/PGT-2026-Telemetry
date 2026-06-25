@@ -218,7 +218,7 @@ def run_can_sender(*, reader, streams, transport, log_prefix="can"):
                         continue
 
                     _process_reading(comps, raw_frame, transport, log_prefix)
-                    time.sleep(0.2)  # give modem time to recover between sends
+                    time.sleep(0.0)  # give modem time to recover between sends
 
         except Exception as exc:
             print(f"[{log_prefix}] Transmit thread crashed: {exc}", flush=True)
