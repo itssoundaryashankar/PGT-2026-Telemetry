@@ -75,7 +75,7 @@ def _process_reading(components, raw_frame, transport, log_prefix):
     device_id = components["device_id"]
     sink = components.get("sink")
     sub_prefix = components.get("log_prefix", log_prefix)
-
+    
     try:
         reading = normalizer(raw_frame, device_id)
     except Exception as exc:
@@ -99,6 +99,12 @@ def _process_reading(components, raw_frame, transport, log_prefix):
         print(f"[{sub_prefix}] Packet build failed: {exc}", flush=True)
         return
 
+    try:
+        t0 = time.time()
+        transport.send_hex(packet.hex())
+        print(f"[{sub_prefix}] TX took {time.time()-t0:.2f}s", flush=True)
+    except Exception as exc:
+        
     if transport is None:
         print(
             f"[{sub_prefix}] {event_type.name} seq={seq} "
