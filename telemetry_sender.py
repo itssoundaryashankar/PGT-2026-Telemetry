@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import sys
+import time
 
 # Make stdout line-buffered so logs appear immediately on Windows / piped runs.
 try:
@@ -27,7 +28,7 @@ DEFAULT_LORA_PORT = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridg
 DEFAULT_LORA_BAUD = 9600
 DEFAULT_FREQ = "868.100"
 DEFAULT_BW = 0
-DEFAULT_SF = 12
+DEFAULT_SF = 9
 DEFAULT_POWER = 20
 DEFAULT_CR = 1
 DEFAULT_CRC = 0
@@ -45,10 +46,18 @@ DEFAULT_POWER_DELTA_W = 10
 DEFAULT_HEARTBEAT_SECONDS = 60
 
 # CAN defaults
+# Frames older than this are discarded rather than transmitted. When the LoRa
+# modem is busy (one TX blocks ~1s+), CAN frames accumulate in the kernel
+# buffer. Without this guard the sender would transmit a backlog of stale
+# readings, causing InfluxDB to show data that is many seconds out of date.
+MAX_FRAME_AGE_SECONDS = 3
+
 DEFAULT_CAN_INTERFACE = "can0"
 DEFAULT_CAN_BITRATE = 500000
 DEFAULT_MPPT_DEVICE_ID = 1    # MPPT #0 -> 10, MPPT #1 -> 11, ...
 DEFAULT_BMS_DEVICE_ID = 20
+DEFAULT_MPPT_HEARTBEAT_SECONDS = 10
+DEFAULT_BMS_HEARTBEAT_SECONDS = 10
 DEFAULT_MPPT_HEARTBEAT_SECONDS = 60
 DEFAULT_BMS_HEARTBEAT_SECONDS = 60
 DEFAULT_CSV_PATH_MPPT = "mppt_data.csv"
@@ -67,6 +76,39 @@ def _process_reading(components, raw_frame, transport, log_prefix):
     device_id = components["device_id"]
     sink = components.get("sink")
     sub_prefix = components.get("log_prefix", log_prefix)
+
+    # Staleness guard: CAN frames carry a hardware rx_timestamp. When the LoRa
+    # modem is busy transmitting (send_hex blocks for ~1s+ per packet), frames
+    # pile up in the kernel CAN buffer. By the time we dequeue them they may be
+    # seconds old. Transmitting stale readings would make InfluxDB show data
+    # that lags real-world conditions by many seconds. We discard any frame
+    # whose rx_timestamp is older than MAX_FRAME_AGE_SECONDS and let the
+    # heartbeat handle the next transmission once the modem is free.
+    # modem is busy transmitting, frames pile up in the kernel CAN buffer. By
+    # the time we dequeue them they may be seconds old. Transmitting stale
+    # readings would make InfluxDB show data that lags real-world conditions.
+    # We discard any frame whose rx_timestamp is older than MAX_FRAME_AGE_SECONDS
+    # and let the heartbeat handle the next transmission once the modem is free.
+    # BMV frames have no rx_timestamp, so they are never dropped here.
+    #
+    # IMPORTANT: python-can may report msg.timestamp as seconds since boot
+    # (monotonic clock, e.g. 5000.0) rather than a Unix epoch timestamp
+    # (e.g. 1_750_000_000). If we subtract a monotonic value from time.time()
+    # the apparent age is ~1.7 billion seconds and every frame gets dropped.
+    # Guard against this by only applying the check when rx_ts looks like a
+    # Unix timestamp (i.e. it is plausibly after the year 2001 = 1_000_000_000).
+    if isinstance(raw_frame, dict):
+        rx_ts = raw_frame.get("rx_timestamp")
+        if rx_ts is not None:
+        if rx_ts is not None and rx_ts > 1_000_000_000:
+            age = time.time() - rx_ts
+            if age > MAX_FRAME_AGE_SECONDS:
+                print(
+                    f"[{sub_prefix}] Dropping stale CAN frame "
+                    f"(age={age:.1f}s > {MAX_FRAME_AGE_SECONDS}s)",
+                    flush=True,
+                )
+                return
 
     try:
         reading = normalizer(raw_frame, device_id)
@@ -248,18 +290,10 @@ def build_can_sender_components(args):
 
     mppt_policy = GenericTransmitPolicy(
         deltas={
-            # Power frame (packet_id 0) fields
             "pv_voltage_v":      args.mppt_pv_voltage_delta_v,
             "pv_current_a":      args.mppt_pv_current_delta_a,
             "pv_power_w":        args.mppt_pv_power_delta_w,
             "battery_voltage_v": args.mppt_batt_voltage_delta_v,
-            # Status frame (packet_id 1) fields — 0.5 threshold means any
-            # integer-enum change fires a send; temps use a 1 °C deadband.
-            "mode":              0.5,
-            "fault":             0.5,
-            "enabled":           0.5,
-            "ambient_temp_c":    1.0,
-            "heatsink_temp_c":   1.0,
         },
         event_type_change=EventType.DELTA_UPDATE,
         event_type_heartbeat=EventType.HEARTBEAT,
