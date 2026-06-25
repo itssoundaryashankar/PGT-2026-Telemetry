@@ -179,7 +179,7 @@ class LoRaTransport:
 
     def send_wait_time(self):
         if self.ack == 0:
-            return 1.0
+            return 0.5
         return 1.5 + (self.retries * 5.5)
 
     def _require_serial(self):
