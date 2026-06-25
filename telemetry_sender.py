@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import sys
+import threading
 import time
 
 # Make stdout line-buffered so logs appear immediately on Windows / piped runs.
@@ -46,15 +47,9 @@ DEFAULT_POWER_DELTA_W = 10
 DEFAULT_HEARTBEAT_SECONDS = 60
 
 # CAN defaults
-# Frames older than this are discarded rather than transmitted. When the LoRa
-# modem is busy (one TX blocks ~1s+), CAN frames accumulate in the kernel
-# buffer. Without this guard the sender would transmit a backlog of stale
-# readings, causing InfluxDB to show data that is many seconds out of date.
-MAX_FRAME_AGE_SECONDS = 3
-
 DEFAULT_CAN_INTERFACE = "can0"
 DEFAULT_CAN_BITRATE = 500000
-DEFAULT_MPPT_DEVICE_ID = 1    # MPPT #0 -> 10, MPPT #1 -> 11, ...
+DEFAULT_MPPT_DEVICE_ID = 1
 DEFAULT_BMS_DEVICE_ID = 20
 DEFAULT_MPPT_HEARTBEAT_SECONDS = 60
 DEFAULT_BMS_HEARTBEAT_SECONDS = 60
@@ -62,9 +57,15 @@ DEFAULT_CSV_PATH_MPPT = "mppt_data.csv"
 DEFAULT_CSV_PATH_BMS = "bms_data.csv"
 DEFAULT_NUM_MPPTS = 6
 
+# How often the CAN transmit thread wakes up to check for changes (seconds).
+# Pkt0 (power) is checked every tick; pkt1 (status) every STATUS_TICKS ticks
+# to prioritize power data over mode/fault/temp on the LoRa link.
+CAN_SAMPLE_INTERVAL = 3.0
+STATUS_TICKS = 5  # transmit status frames at most once per 5 × 3s = 15s
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE LOOP — supports both single-stream (BMV) and multi-stream (CAN) readers
+# CORE LOOP — BMV single-stream sender (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _process_reading(components, raw_frame, transport, log_prefix):
@@ -74,32 +75,6 @@ def _process_reading(components, raw_frame, transport, log_prefix):
     device_id = components["device_id"]
     sink = components.get("sink")
     sub_prefix = components.get("log_prefix", log_prefix)
-
-    # Staleness guard: CAN frames carry a hardware rx_timestamp. When the LoRa
-    # modem is busy transmitting, frames pile up in the kernel CAN buffer. By
-    # the time we dequeue them they may be seconds old. Transmitting stale
-    # readings would make InfluxDB show data that lags real-world conditions.
-    # We discard any frame whose rx_timestamp is older than MAX_FRAME_AGE_SECONDS
-    # and let the heartbeat handle the next transmission once the modem is free.
-    # BMV frames have no rx_timestamp, so they are never dropped here.
-    #
-    # IMPORTANT: python-can may report msg.timestamp as seconds since boot
-    # (monotonic clock, e.g. 5000.0) rather than a Unix epoch timestamp
-    # (e.g. 1_750_000_000). If we subtract a monotonic value from time.time()
-    # the apparent age is ~1.7 billion seconds and every frame gets dropped.
-    # Guard against this by only applying the check when rx_ts looks like a
-    # Unix timestamp (i.e. it is plausibly after the year 2001 = 1_000_000_000).
-    if isinstance(raw_frame, dict):
-        rx_ts = raw_frame.get("rx_timestamp")
-        if rx_ts is not None and rx_ts > 1_000_000_000:
-            age = time.time() - rx_ts
-            if age > MAX_FRAME_AGE_SECONDS:
-                print(
-                    f"[{sub_prefix}] Dropping stale CAN frame "
-                    f"(age={age:.1f}s > {MAX_FRAME_AGE_SECONDS}s)",
-                    flush=True,
-                )
-                return
 
     try:
         reading = normalizer(raw_frame, device_id)
@@ -157,58 +132,118 @@ def run_sender(
     sink=None,
     transport=None,
 ):
-    """Single-stream (BMV) or multi-stream (CAN) sender loop."""
-    if streams is None:
-        if normalizer is None or policy is None or packet_builder is None:
-            raise ValueError(
-                "run_sender needs either a `streams` dict or the full set of "
-                "single-stream kwargs (normalizer/policy/packet_builder/...)"
-            )
-        streams = {
-            "_default": {
-                "normalizer": normalizer,
-                "policy": policy,
-                "packet_builder": packet_builder,
-                "device_id": device_id,
-                "sink": sink,
-                "log_prefix": log_prefix,
-            }
-        }
-        single_stream = True
-    else:
-        single_stream = False
+    """Single-stream (BMV) sender loop."""
+    if streams is not None:
+        raise ValueError(
+            "run_sender no longer handles multi-stream CAN — use run_can_sender instead."
+        )
+    if normalizer is None or policy is None or packet_builder is None:
+        raise ValueError(
+            "run_sender needs normalizer/policy/packet_builder."
+        )
+
+    components = {
+        "normalizer": normalizer,
+        "policy": policy,
+        "packet_builder": packet_builder,
+        "device_id": device_id,
+        "sink": sink,
+        "log_prefix": log_prefix,
+    }
 
     print(f"[{log_prefix}] Starting sender loop", flush=True)
-    for kind, comps in streams.items():
-        if kind != "_default":
-            print(
-                f"[{log_prefix}]   stream: {kind} -> "
-                f"device_id={comps.get('device_id')}, "
-                f"policy={type(comps['policy']).__name__}",
-                flush=True,
-            )
-
     try:
         while True:
-            result = reader.read_frame()
-            if single_stream:
-                kind = "_default"
-                raw_frame = result
-            else:
+            raw_frame = reader.read_frame()
+            _process_reading(components, raw_frame, transport, log_prefix)
+    finally:
+        reader.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CAN SENDER — latest-value cache architecture
+#
+# Reader thread:   reads CAN frames as fast as they arrive, overwrites a
+#                  shared cache dict keyed by (kind, can_id). No queueing —
+#                  intermediate frames are naturally discarded.
+#
+# Transmit thread: wakes every CAN_SAMPLE_INTERVAL seconds, iterates the
+#                  cache, runs policy.classify() on each slot, and sends
+#                  whatever is due. Power frames (pkt0) are checked every
+#                  tick; status frames (pkt1) every STATUS_TICKS ticks.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_can_sender(*, reader, streams, transport, log_prefix="can"):
+    """Multi-stream CAN sender using a latest-value cache + timed TX thread."""
+
+    # cache[(kind, can_id)] = raw_frame dict (overwritten on every new frame)
+    cache = {}
+    cache_lock = threading.Lock()
+    stop_event = threading.Event()
+
+    def _reader_thread():
+        try:
+            while not stop_event.is_set():
+                result = reader.read_frame()
                 if result is None:
                     continue
                 kind, raw_frame = result
+                can_id = raw_frame.get("can_id")
+                with cache_lock:
+                    cache[(kind, can_id)] = raw_frame
+        except Exception as exc:
+            print(f"[{log_prefix}] Reader thread crashed: {exc}", flush=True)
+        finally:
+            reader.close()
 
-            comps = streams.get(kind)
-            if comps is None:
-                print(
-                    f"[{log_prefix}] Unknown stream kind {kind!r}, skipping",
-                    flush=True,
-                )
-                continue
-            _process_reading(comps, raw_frame, transport, log_prefix)
+    def _transmit_thread():
+        tick = 0
+        try:
+            while not stop_event.is_set():
+                time.sleep(CAN_SAMPLE_INTERVAL)
+                tick += 1
+
+                with cache_lock:
+                    snapshot = dict(cache)
+
+                for (kind, can_id), raw_frame in snapshot.items():
+                    comps = streams.get(kind)
+                    if comps is None:
+                        continue
+
+                    # Deprioritize status frames (pkt1): only process every
+                    # STATUS_TICKS ticks so power frames dominate LoRa airtime.
+                    packet_id = raw_frame.get("can_id", 0) & 0x0F
+                    if packet_id == 1 and (tick % STATUS_TICKS) != 0:
+                        continue
+
+                    _process_reading(comps, raw_frame, transport, log_prefix)
+
+        except Exception as exc:
+            print(f"[{log_prefix}] Transmit thread crashed: {exc}", flush=True)
+
+    print(f"[{log_prefix}] Starting CAN sender (cache+timer architecture)", flush=True)
+    for kind, comps in streams.items():
+        print(
+            f"[{log_prefix}]   stream: {kind} -> "
+            f"device_id={comps.get('device_id')}, "
+            f"policy={type(comps['policy']).__name__}",
+            flush=True,
+        )
+
+    rt = threading.Thread(target=_reader_thread, name=f"{log_prefix}-reader", daemon=True)
+    tt = threading.Thread(target=_transmit_thread, name=f"{log_prefix}-tx", daemon=True)
+    rt.start()
+    tt.start()
+
+    try:
+        while rt.is_alive() and tt.is_alive():
+            rt.join(timeout=0.5)
+            tt.join(timeout=0.5)
+    except KeyboardInterrupt:
+        pass
     finally:
-        reader.close()
+        stop_event.set()
 
 
 def build_lora_transport(args):
@@ -257,7 +292,6 @@ def build_bmv_sender_components(args):
 
 def build_can_sender_components(args):
     """Reads MPPT and BMS frames off the CAN bus into two packet streams."""
-    # Local imports keep non-Pi machines importable without python-can.
     from CAN.can_reader import CANReader
     from CAN.can_normalizer import (
         normalize_mppt_frame,
@@ -341,7 +375,6 @@ SENDER_COMPONENT_BUILDERS = {
 class LockedTransport:
     """Serialize send_hex across threads sharing one LoRa modem."""
     def __init__(self, inner):
-        import threading
         self._inner = inner
         self._lock = threading.Lock()
 
@@ -400,10 +433,9 @@ def build_parser():
     parser.add_argument("--can-interface", default=DEFAULT_CAN_INTERFACE,
                         help="SocketCAN interface name (e.g. can0)")
     parser.add_argument("--can-bitrate", type=int, default=DEFAULT_CAN_BITRATE,
-                        help="CAN bus bitrate (default 125000 for TPEE; "
-                             "set 500000 if BMS forces Pylontech 500k)")
+                        help="CAN bus bitrate")
     parser.add_argument("--num-mppts", type=int, default=DEFAULT_NUM_MPPTS,
-                        help="Number of TPEE MPPTs on the bus (IDs 0x20..0x20+N-1)")
+                        help="Number of TPEE MPPTs on the bus")
     parser.add_argument("--csv-path-mppt", default=DEFAULT_CSV_PATH_MPPT,
                         help="CSV output path for MPPT data")
     parser.add_argument("--csv-path-bms", default=DEFAULT_CSV_PATH_BMS,
@@ -452,16 +484,14 @@ def build_parser():
     return parser
 
 
-def _run_in_thread(name, components, transport):
-    import threading
-
+def _run_bmv_in_thread(components, transport):
     def _target():
         try:
             run_sender(**components, transport=transport)
         except Exception as exc:
-            print(f"[{name}] thread crashed: {exc}", flush=True)
+            print(f"[bmv] thread crashed: {exc}", flush=True)
 
-    t = threading.Thread(target=_target, name=name, daemon=True)
+    t = threading.Thread(target=_target, name="bmv", daemon=True)
     t.start()
     return t
 
@@ -486,7 +516,19 @@ def _run_all(args, transport):
     print(f"[all] Starting {len(components_built)} source(s): "
           f"{[name for name, _ in components_built]}", flush=True)
 
-    threads = [_run_in_thread(name, comps, transport) for name, comps in components_built]
+    threads = []
+    for name, comps in components_built:
+        if name == "bmv":
+            threads.append(_run_bmv_in_thread(comps, transport))
+        elif name == "can":
+            t = threading.Thread(
+                target=run_can_sender,
+                kwargs={**comps, "transport": transport},
+                name="can",
+                daemon=True,
+            )
+            t.start()
+            threads.append(t)
 
     try:
         while any(t.is_alive() for t in threads):
@@ -508,7 +550,7 @@ def main(argv=None):
         if is_all_mode:
             raise ValueError("--dry-run is not supported with --device all "
                              "(use --device bmv or --device can)")
-        run_sender(**components)
+        run_sender(**{k: v for k, v in components.items() if k != "streams"})
         return
 
     if args.transport != "lora":
@@ -517,6 +559,8 @@ def main(argv=None):
     with build_lora_transport(args) as transport:
         if is_all_mode:
             _run_all(args, LockedTransport(transport))
+        elif args.device == "can":
+            run_can_sender(**components, transport=transport)
         else:
             run_sender(**components, transport=transport)
 
