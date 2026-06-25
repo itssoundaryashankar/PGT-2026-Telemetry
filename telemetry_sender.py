@@ -56,8 +56,6 @@ DEFAULT_CAN_INTERFACE = "can0"
 DEFAULT_CAN_BITRATE = 500000
 DEFAULT_MPPT_DEVICE_ID = 1    # MPPT #0 -> 10, MPPT #1 -> 11, ...
 DEFAULT_BMS_DEVICE_ID = 20
-DEFAULT_MPPT_HEARTBEAT_SECONDS = 10
-DEFAULT_BMS_HEARTBEAT_SECONDS = 10
 DEFAULT_MPPT_HEARTBEAT_SECONDS = 60
 DEFAULT_BMS_HEARTBEAT_SECONDS = 60
 DEFAULT_CSV_PATH_MPPT = "mppt_data.csv"
@@ -78,12 +76,6 @@ def _process_reading(components, raw_frame, transport, log_prefix):
     sub_prefix = components.get("log_prefix", log_prefix)
 
     # Staleness guard: CAN frames carry a hardware rx_timestamp. When the LoRa
-    # modem is busy transmitting (send_hex blocks for ~1s+ per packet), frames
-    # pile up in the kernel CAN buffer. By the time we dequeue them they may be
-    # seconds old. Transmitting stale readings would make InfluxDB show data
-    # that lags real-world conditions by many seconds. We discard any frame
-    # whose rx_timestamp is older than MAX_FRAME_AGE_SECONDS and let the
-    # heartbeat handle the next transmission once the modem is free.
     # modem is busy transmitting, frames pile up in the kernel CAN buffer. By
     # the time we dequeue them they may be seconds old. Transmitting stale
     # readings would make InfluxDB show data that lags real-world conditions.
@@ -99,7 +91,6 @@ def _process_reading(components, raw_frame, transport, log_prefix):
     # Unix timestamp (i.e. it is plausibly after the year 2001 = 1_000_000_000).
     if isinstance(raw_frame, dict):
         rx_ts = raw_frame.get("rx_timestamp")
-        if rx_ts is not None:
         if rx_ts is not None and rx_ts > 1_000_000_000:
             age = time.time() - rx_ts
             if age > MAX_FRAME_AGE_SECONDS:
