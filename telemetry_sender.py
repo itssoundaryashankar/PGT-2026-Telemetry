@@ -60,7 +60,7 @@ DEFAULT_NUM_MPPTS = 6
 # How often the CAN transmit thread wakes up to check for changes (seconds).
 # Pkt0 (power) is checked every tick; pkt1 (status) every STATUS_TICKS ticks
 # to prioritize power data over mode/fault/temp on the LoRa link.
-CAN_SAMPLE_INTERVAL = 3.0
+CAN_SAMPLE_INTERVAL = 1.0
 STATUS_TICKS = 5  # transmit status frames at most once per 5 × 3s = 15s
 
 
@@ -218,7 +218,7 @@ def run_can_sender(*, reader, streams, transport, log_prefix="can"):
                         continue
 
                     _process_reading(comps, raw_frame, transport, log_prefix)
-                    time.sleep(0.5)  # give modem time to recover between sends
+                    time.sleep(0.2)  # give modem time to recover between sends
 
         except Exception as exc:
             print(f"[{log_prefix}] Transmit thread crashed: {exc}", flush=True)
