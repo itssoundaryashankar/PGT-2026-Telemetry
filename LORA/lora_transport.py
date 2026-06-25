@@ -54,7 +54,7 @@ def try_probe_modem(ser):
 
 def open_serial(port, baud):
     ser = serial.Serial(port, baud, timeout=0.5)
-    time.sleep(2.0)  # LA66 needs ~1-2s to boot before accepting AT commands
+    time.sleep(2.0)  # LA66 needs ~2s to boot before accepting AT commands
     ser.reset_input_buffer()
     ser.reset_output_buffer()
     return ser
@@ -101,18 +101,30 @@ class LoRaTransport:
         self.serial = None
 
     def __enter__(self):
-        self.serial = open_serial(self.port, self.baud)
-        reset_required = self.configure_modem()
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if self.serial:
+                    self.serial.close()
+                self.serial = open_serial(self.port, self.baud)
+                reset_required = self.configure_modem()
 
-        if reset_required:
-            print("[lora] Applying pending modem settings")
-            send_cmd(self.serial, "ATZ", wait=0.5)
-            self.serial.close()
-            time.sleep(2.0)
-            self.serial = open_serial(self.port, self.baud)
-            try_probe_modem(self.serial)
+                if reset_required:
+                    print("[lora] Applying pending modem settings")
+                    send_cmd(self.serial, "ATZ", wait=0.5)
+                    self.serial.close()
+                    time.sleep(2.0)
+                    self.serial = open_serial(self.port, self.baud)
+                    try_probe_modem(self.serial)
 
-        return self
+                return self
+
+            except RuntimeError as exc:
+                print(f"[lora] Modem init attempt {attempt}/{max_attempts} failed: {exc}")
+                if attempt < max_attempts:
+                    time.sleep(3.0)
+                else:
+                    raise
 
     def __exit__(self, exc_type, exc, tb):
         if self.serial and self.serial.is_open:
