@@ -50,7 +50,7 @@ DEFAULT_HEARTBEAT_SECONDS = 60
 # modem is busy (one TX blocks ~1s+), CAN frames accumulate in the kernel
 # buffer. Without this guard the sender would transmit a backlog of stale
 # readings, causing InfluxDB to show data that is many seconds out of date.
-MAX_FRAME_AGE_SECONDS = 5
+MAX_FRAME_AGE_SECONDS = 3
 
 DEFAULT_CAN_INTERFACE = "can0"
 DEFAULT_CAN_BITRATE = 500000
