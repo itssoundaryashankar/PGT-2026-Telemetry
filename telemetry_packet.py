@@ -138,11 +138,6 @@ BMS_FIELD_LAYOUT = (
 
 
 _PACK_SCALES = {
-    "voltage_mv":           1000,
-    "current_ma":           1000,
-    "power_w":              1,
-    "charge_state":         1,
-    "alarm":                1,
     "pv_voltage_v":         100,
     "pv_current_a":         2000,
     "pv_power_w":           100,
@@ -175,7 +170,20 @@ _LAYOUTS = {
     MsgType.BMS:  BMS_FIELD_LAYOUT,
 }
 
-_RAW_INT_MSG_TYPES = frozenset()
+# _RAW_INT_MSG_TYPES controls the PACK path only — BMV fields are stored as
+# raw integers on the wire (VE.Direct delivers mV/mA integers directly).
+# Decode scaling is handled separately via _DECODE_SCALES.
+_RAW_INT_MSG_TYPES = frozenset({MsgType.BMV})
+
+# Applied during decode only. Converts raw wire integers to engineering units
+# for BMV fields before they reach the receiver / Influx writer.
+_DECODE_SCALES = {
+    "voltage_mv":   1000,   # mV -> V
+    "current_ma":   1000,   # mA -> A
+    "power_w":      1,
+    "charge_state": 1,
+    "alarm":        1,
+}
 
 
 def _scale_for(field_name):
@@ -339,7 +347,8 @@ def decode_payload(msg_type, field_mask, payload):
         encoded = struct.unpack(fmt, payload[offset:offset + size])[0]
         offset += size
         if use_raw:
-            fields[field_name] = encoded
+            decode_scale = _DECODE_SCALES.get(field_name, 1)
+            fields[field_name] = encoded / decode_scale if decode_scale != 1 else encoded
         else:
             scale = _scale_for(field_name)
             fields[field_name] = encoded / scale if scale != 1 else encoded
