@@ -138,6 +138,11 @@ BMS_FIELD_LAYOUT = (
 
 
 _PACK_SCALES = {
+    "voltage_mv":           1000,
+    "current_ma":           1000,
+    "power_w":              1,
+    "charge_state":         1,
+    "alarm":                1,
     "pv_voltage_v":         100,
     "pv_current_a":         2000,
     "pv_power_w":           100,
@@ -170,7 +175,7 @@ _LAYOUTS = {
     MsgType.BMS:  BMS_FIELD_LAYOUT,
 }
 
-_RAW_INT_MSG_TYPES = frozenset({MsgType.BMV})
+_RAW_INT_MSG_TYPES = frozenset()
 
 
 def _scale_for(field_name):
